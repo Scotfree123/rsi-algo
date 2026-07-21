@@ -21,56 +21,6 @@ NEW_BUY_CUTOFF = None
 BUFFER = 120            # keep last N closes per symbol (need >= TREND_LOOKBACK+few)
 
 # ============================== INDICATORS (match backtest) ==============================
-def ema(vals, period):
-    a = 2/(period+1); e = vals[0]
-    for v in vals[1:]:
-        e = a*v + (1-a)*e
-    return e
-
-def ema_series(vals, period):
-    a = 2/(period+1); out=[vals[0]]
-    for v in vals[1:]:
-        out.append(a*v + (1-a)*out[-1])
-    return out
-
-def rsi_wilder(vals, period):
-    if len(vals) < period+1: return float("nan")
-    deltas = np.diff(vals)
-    up = np.clip(deltas,0,None); dn = -np.clip(deltas,None,0)
-    ru = up[0]; rd = dn[0]
-    a = 1/period
-    for i in range(1,len(deltas)):
-        ru = a*up[i] + (1-a)*ru
-        rd = a*dn[i] + (1-a)*rd
-    if rd == 0: return 100.0
-    return 100 - 100/(1+ru/rd)
-
-# ============================== BROKER (>>> HOOK UP Alpaca here) ==============================
-class Broker:
-    def __init__(self, paper=True):
-        self.paper = paper
-        # >>> HOOK UP: create Alpaca client here, e.g.
-        # from alpaca.trading.client import TradingClient
-        # self.client = TradingClient(API_KEY, API_SECRET, paper=True)
-        self.client = None
-
-    def buy(self, symbol, shares, ref_price):
-        # >>> HOOK UP: submit a market BUY for `shares` of `symbol`
-        # order = MarketOrderRequest(symbol=symbol, qty=shares, side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
-        # self.client.submit_order(order)
-        print(f"[BUY ] {symbol}  {shares}sh  ~{ref_price:.2f}   (paper={self.paper})")
-
-    def stop(self, symbol, shares, stop_price):
-        # >>> HOOK UP: submit a STOP (sell) at stop_price to cap the -5% downside
-        # order = StopOrderRequest(symbol=symbol, qty=shares, side=OrderSide.SELL, stop_price=round(stop_price,2), time_in_force=TimeInForce.DAY)
-        # self.client.submit_order(order)
-        print(f"[STOP] {symbol}  sell {shares}sh @ {stop_price:.2f}  (-{STOP_PCT}% floor)")
-
-    def alert_open(self, symbol, entry):
-        # Position is now OPEN. The PROFIT sell is CYBORG — trader works it by hand.
-        print(f"[OPEN] {symbol} filled ~{entry:.2f}. >>> CYBORG SELL: trader works the exit by eye. Stop is set at -{STOP_PCT}%.")
-
-# ============================== SIGNAL ENGINE ==============================
 class SymbolState:
     def __init__(self):
         self.closes = deque(maxlen=BUFFER)
@@ -155,10 +105,11 @@ class Engine:
             rose = (black - st.black_low_since_arm)/st.black_low_since_arm*100
             if rose >= FIRE_DISTANCE:
                 st.armed = False
-                # ---- TREND GATE: black up >= TREND_GATE% over last 30 bars ----
+                # ---- TEST 1: black line must be TRENDING DOWN >= DOWN_TEST% over last 30 bars ----
+                # (the deep-dip context. TEST 2 = the 0.4% up-bend above already fired.)
                 past = blk[-1-TREND_LOOKBACK]
                 trend = (black - past)/past*100
-                if trend < TREND_GATE: return          # not a real trend -> skip
+                if trend > -DOWN_TEST: return           # not a real decline -> skip
                 # ---- TIME CUTOFF for new buys ----
                 if NEW_BUY_CUTOFF and ts.time() >= NEW_BUY_CUTOFF: return
                 # ---- BUY + STOP ----
@@ -172,16 +123,5 @@ class Engine:
 if __name__ == "__main__":
     broker = Broker(paper=True)
     engine = Engine(broker)
-    print("RSI TREND CYBORG SELL live engine ready. RSI_LEVEL=%d  STOP=-%d%%  symbols=%s"
+    print("TWO-TEST CYBORG engine ready. RSI_LEVEL=%d  STOP=-%d%%  symbols=%s"
           % (RSI_LEVEL, STOP_PCT, ",".join(SYMBOLS)))
-    # >>> HOOK UP: subscribe to Alpaca (or Barchart) 1-min bars and route each to engine.on_bar:
-    #
-    #   from alpaca.data.live import StockDataStream
-    #   stream = StockDataStream(API_KEY, API_SECRET)
-    #   async def handler(bar):
-    #       engine.on_bar(bar.symbol, bar.timestamp, bar.close)
-    #   for s in SYMBOLS: stream.subscribe_bars(handler, s)
-    #   stream.run()
-    #
-    # For the profit sell (cyborg): when the trader closes a position by hand,
-    # call engine.mark_flat(symbol) so the engine resumes watching that symbol.
