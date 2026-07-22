@@ -1,3 +1,27 @@
+"""
+TWO-TEST CYBORG ENGINE — Live/Paper Signal Engine  (starter for Alexander to hook up)
+=====================================================================================
+WHAT THIS DOES
+  Watches a set of tickers on 1-minute bars. When a BUY setup fires (per the exact
+  backtested rules below), it places a paper BUY + a -5% protective STOP via Alpaca.
+  The PROFIT sell is NOT automated — it is CYBORG (done by hand). The engine only
+  flags/logs an open position for the trader to work the exit by eye.
+
+WHAT ALEXANDER NEEDS TO HOOK UP  (search for  >>> HOOK UP)
+  1. Real-time 1-minute bar feed  ->  call engine.on_bar(symbol, bar) for each new bar
+  2. Alpaca paper client          ->  fill in Broker.buy() and Broker.stop()
+  3. (optional) an alert/log sink ->  Broker already prints; wire to Slack/file if wanted
+
+MUST MATCH THE BACKTEST EXACTLY (do not change the math):
+  - black line  = EMA-20 of close
+  - RSI         = Wilder RSI-7 of close
+  - session     = regular hours 09:30–15:59 ET, 1-min bars
+"""
+
+from collections import deque, defaultdict
+from datetime import datetime, time
+import numpy as np
+
 # ============================== CONFIG ==============================
 # The 4 pairs we have data for (add SOXL/SOXS, SNXX/SNDQ once available).
 # Run ALL tickers — the falling twin simply won't fire (its black line won't turn up),
@@ -9,7 +33,7 @@ RSI_PERIOD    = 7
 EMA_PERIOD    = 20
 ARM_WINDOW    = 25      # bars: arm expires if no fire within this many bars
 FIRE_DISTANCE = 0.4     # % the black line must rise off its low (since arm) to fire
-TREND_GATE    = 1.0     # % the black line must have risen over the last 30 bars
+DOWN_TEST     = 1.0     # TEST 1: black line must have DECLINED at least this % over last 30 bars
 TREND_LOOKBACK= 30      # bars
 STOP_PCT      = 5.0     # % hard protective stop (the disaster floor)
 SHARES        = 1       # 1 share for the live test
@@ -21,6 +45,56 @@ NEW_BUY_CUTOFF = None
 BUFFER = 120            # keep last N closes per symbol (need >= TREND_LOOKBACK+few)
 
 # ============================== INDICATORS (match backtest) ==============================
+def ema(vals, period):
+    a = 2/(period+1); e = vals[0]
+    for v in vals[1:]:
+        e = a*v + (1-a)*e
+    return e
+
+def ema_series(vals, period):
+    a = 2/(period+1); out=[vals[0]]
+    for v in vals[1:]:
+        out.append(a*v + (1-a)*out[-1])
+    return out
+
+def rsi_wilder(vals, period):
+    if len(vals) < period+1: return float("nan")
+    deltas = np.diff(vals)
+    up = np.clip(deltas,0,None); dn = -np.clip(deltas,None,0)
+    ru = up[0]; rd = dn[0]
+    a = 1/period
+    for i in range(1,len(deltas)):
+        ru = a*up[i] + (1-a)*ru
+        rd = a*dn[i] + (1-a)*rd
+    if rd == 0: return 100.0
+    return 100 - 100/(1+ru/rd)
+
+# ============================== BROKER (>>> HOOK UP Alpaca here) ==============================
+class Broker:
+    def __init__(self, paper=True):
+        self.paper = paper
+        # >>> HOOK UP: create Alpaca client here, e.g.
+        # from alpaca.trading.client import TradingClient
+        # self.client = TradingClient(API_KEY, API_SECRET, paper=True)
+        self.client = None
+
+    def buy(self, symbol, shares, ref_price):
+        # >>> HOOK UP: submit a market BUY for `shares` of `symbol`
+        # order = MarketOrderRequest(symbol=symbol, qty=shares, side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
+        # self.client.submit_order(order)
+        print(f"[BUY ] {symbol}  {shares}sh  ~{ref_price:.2f}   (paper={self.paper})")
+
+    def stop(self, symbol, shares, stop_price):
+        # >>> HOOK UP: submit a STOP (sell) at stop_price to cap the -5% downside
+        # order = StopOrderRequest(symbol=symbol, qty=shares, side=OrderSide.SELL, stop_price=round(stop_price,2), time_in_force=TimeInForce.DAY)
+        # self.client.submit_order(order)
+        print(f"[STOP] {symbol}  sell {shares}sh @ {stop_price:.2f}  (-{STOP_PCT}% floor)")
+
+    def alert_open(self, symbol, entry):
+        # Position is now OPEN. The PROFIT sell is CYBORG — trader works it by hand.
+        print(f"[OPEN] {symbol} filled ~{entry:.2f}. >>> CYBORG SELL: trader works the exit by eye. Stop is set at -{STOP_PCT}%.")
+
+# ============================== SIGNAL ENGINE ==============================
 class SymbolState:
     def __init__(self):
         self.closes = deque(maxlen=BUFFER)
@@ -120,8 +194,3 @@ class Engine:
                 st.entry_price = close
 
 # ============================== RUN (>>> HOOK UP live feed) ==============================
-if __name__ == "__main__":
-    broker = Broker(paper=True)
-    engine = Engine(broker)
-    print("TWO-TEST CYBORG engine ready. RSI_LEVEL=%d  STOP=-%d%%  symbols=%s"
-          % (RSI_LEVEL, STOP_PCT, ",".join(SYMBOLS)))
