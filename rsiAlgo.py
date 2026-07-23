@@ -1,35 +1,40 @@
 #!/usr/bin/env python3
 # =============================================================================
-#  RSI SYSTEM  (RSI Signal Buy-Sell)  --  Python runner v1.2  [TradeStation]
+#  RSI SYSTEM  --  persistent arm->fire signals + Two Step execution
 #  Innovative Investment Research -- TradingSystem
 #  TradeStation WebAPI v3 (OAuth refresh-token)  |  Lightsail / tmux
 #
-#  Spec:  RSI_System_Spec_v1_2.docx (May 30, 2026)
+#  WHAT THIS IS
+#  ------------
+#  Three layers, from three places:
 #
-#  PORT NOTE
-#  ---------
-#  This is the Alpaca-paper engine ported to TradeStation. The ENTIRE strategy
-#  layer below the "broker adapter" line is UNCHANGED from the working Alpaca
-#  runner: indicators, the two-step (arm -> fire) state machine, black-line and
-#  chop filters, portfolio slots, stop-and-reverse, session gating. Only the
-#  broker calls were swapped, via a TradeStationClient that exposes the SAME
-#  method names the engine already called (get_bars/submit_order/list_positions/
-#  get_position/get_latest_trade/close_position/get_account).
+#    SIGNALS    RSI system (rsiAlgo.py), ported verbatim in behavior:
+#               arm on RSI cross-up, fire when the black line (EMA20) has
+#               risen FIRE_DISTANCE% off its low since the arm. PERSISTENT --
+#               once the rise is achieved inside the window, it fires. Not a
+#               single-bar inflection.
+#    EXECUTION  Two Step: pair mutual-exclusion, portfolio slots,
+#               stop-and-reverse, ATR hard stop, EOD flatten.
+#    PLUMBING   Algo 1 v5: TradeStationClient (OAuth + WebAPI v3).
 #
-#  SAFETY (read this)
-#  ------------------
-#   * TS_ENV       = "sim" (default) or "live". "sim" hits sim-api.tradestation.com
-#                    and touches nothing on the real account. Start here.
-#   * DRY_RUN      = "1" (default). Logs FIRE/EXIT/orders but does NOT send them.
-#                    Set DRY_RUN=0 only after you've watched a full sim session.
-#   These two guards replace the Alpaca "refuse if not paper" guard. Flip them
-#   deliberately -- this trades Gary's real account when TS_ENV=live AND DRY_RUN=0.
+#  REMOVED vs. the previous merge (deliberately):
+#    * black-line slope-degree blocker (sl6/sl10, block_thresh_deg)
+#    * chop filter (HMA flips + swing amplitude)
+#    * HMA entirely -- nothing uses it now
+#    * slope_per_degree -- the uncalibrated placeholder is gone from the
+#      entry path completely. Nothing in the default config depends on it.
+#    * single-bar turn_up inflection -- replaced by the persistent rise
 #
-#  CALIBRATION: SLOPE_PER_DEGREE is STILL a placeholder (0.0025). This is the
-#  reason the live logs never fired -- black_ok/chop_ok rejected every candidate.
-#  Calibrate per spec 6.2 before the degree thresholds mean anything.
+#  Bars are 1-MINUTE.
 #
-#  Run (in tmux on Lightsail, venv active):
+#  SAFETY
+#  ------
+#   * TS_ENV   = "sim" (default) or "live".
+#   * DRY_RUN  = "1" (default). Logs FIRE/EXIT but sends nothing.
+#     With the filters stripped this system fires considerably more often
+#     than the previous build. Watch a full sim session before DRY_RUN=0.
+#
+#  Run (tmux on Lightsail, venv active):
 #      source ~/algotrend1v5/venv/bin/activate
 #      set -a; source .env; set +a
 #      python3 rsi_system_ts.py
@@ -38,11 +43,10 @@
 import os
 import sys
 import time
-import math
 import signal as _sig
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -52,16 +56,16 @@ from dotenv import load_dotenv
 
 # ------------------------------------------------------------------ config ---
 
-AZ = ZoneInfo("America/Phoenix")     # spec 10.4 -- log/display timezone
+AZ = ZoneInfo("America/Phoenix")     # log/display timezone
 ET = ZoneInfo("America/New_York")    # session gating (exchange time)
 
 PAIRS = [
     ("RGTX", "RGTZ"),
     ("NBIL", "NBIZ"),
     ("APLX", "APLZ"),
-    ("IRE",  "IREZ"),   # verify ticker resolution (spec 11.1)
+    ("IRE",  "IREZ"),   # verify ticker resolution
     ("MSTU", "MSTZ"),
-    ("CRWV", "CORD"),   # verify pairing (spec 11.1)
+    ("CRWV", "CORD"),   # verify pairing
 ]
 SYMBOLS = [s for pair in PAIRS for s in pair]
 PAIR_OF = {s: i for i, pair in enumerate(PAIRS) for s in pair}
@@ -71,43 +75,58 @@ SIDE_OF.update({pair[1]: "INVERSE" for pair in PAIRS})
 
 @dataclass
 class Params:
-    # indicator periods (locked, spec 7)
+    # ---- signal layer (RSI system) --------------------------------------
     rsi_period: int = 7
-    rsi_arm_level: float = 30.0
-    hma_period: int = 7
-    ema_period: int = 20
+    rsi_arm_level: float = 40.0    # 40 = shake-out/plumbing test. 35 for real.
+    ema_period: int = 20           # the black line
+    arm_window: int = 25           # bars; arm expires if no fire within this
+    fire_distance_pct: float = 0.4 # % the black line must rise off its low
+
+    # trend gate -- also black-line based. OFF by default: on 1-min bars it
+    # fights the fire condition. RSI arms on a dip, and 30 bars later the dip
+    # is still inside the lookback, so the trend reads negative exactly when
+    # you're arming. Turn it back on only after you've seen the raw signal
+    # rate in sim, and if you do, start near 0.0 ("black line not falling")
+    # rather than 1.0.
+    use_trend_gate: bool = False
+    trend_gate_pct: float = 1.0    # % the black line must have risen...
+    trend_lookback: int = 30       # ...over this many bars (still computed
+                                   #    for the status board either way)
+
+    # ---- execution layer (Two Step) -------------------------------------
     atr_period: int = 14
-    # entry state machine (spec 5.2)
-    armed_window: int = 8
-    red_inflect_lookback: int = 2
-    # black-line multi-window slope (spec 5.7)
-    block_thresh_deg: float = 8.0
-    block_window: int = 6
-    decel_window: int = 10
-    # sell rule (spec 5.3/5.7)
+    stop_mult_atr: float = 1.5
+    money_per_position: float = 10_000.0
+    fixed_shares: int = 0          # >0 overrides money sizing (use 1 for a live toe-dip)
+    max_slots: int = 3
+
+    # exit rule: "stop_eod" = hard stop + EOD flatten only, trader works the
+    # profit exit by hand (the RSI system's cyborg design).
+    # "slope_decay" = Two Step's automated slope exit. Requires calibrating
+    # slope_per_degree first; leave it off until you do.
+    exit_mode: str = "stop_eod"
     sell_thresh_deg: float = 10.0
     sell_window: int = 6
     sell_consec_bars: int = 2
-    # chop filter (spec 5.6)
-    chop_flip_lookback: int = 20
-    max_hma_flips: int = 3
-    min_swing_amp_atr: float = 0.5
-    # hard stop (spec 5.4)
-    stop_mult_atr: float = 1.5
-    # session (spec 5.5), exchange time HH:MM
-    no_entry_after_et: str = "15:45"
-    flatten_at_et: str = "15:55"
+    slope_per_degree: float = 0.0025   # PLACEHOLDER -- only used if exit_mode="slope_decay"
+
+    # ---- session (exchange time HH:MM) ----------------------------------
     market_open_et: str = "09:30"
     market_close_et: str = "16:00"
-    # sizing (spec 5.1)
-    money_per_position: float = 10_000.0
-    max_slots: int = 3
-    # calibration (spec 6) -- PLACEHOLDER, must be calibrated
-    slope_per_degree: float = 0.0025
-    # engine
-    bar_minutes: int = 3
+    no_entry_after_et: str = "15:45"
+    flatten_at_et: str = "15:55"
+
+    # ---- engine ----------------------------------------------------------
+    bar_minutes: int = 1
     poll_seconds: int = 15
-    bar_lookback: int = 200   # bars fetched per symbol per cycle
+    bar_lookback: int = 400        # raised: ~half get dropped by the session
+                                   # filter below, and we need 42 clean ones
+    # Drop any bar whose timestamp falls outside 09:30-16:00 ET before it
+    # reaches an indicator. rsiAlgo did this per-bar; the merge lost it and
+    # was feeding overnight/pre-market prints straight into EMA/RSI/ATR.
+    filter_bars_to_session: bool = True
+    status_every_seconds: int = 60   # status board cadence; 0 = off
+    resync_every_seconds: int = 60   # re-read broker positions (catches manual closes)
 
 
 P = Params()
@@ -135,19 +154,30 @@ def log(msg):
 
 
 # =============================================================================
-#  BROKER ADAPTER  --  TradeStation WebAPI v3
-#  Everything ABOVE stays generic; everything BELOW this block until the
-#  "indicators" banner is the only broker-specific code. It mirrors the exact
-#  method surface the engine used on the Alpaca REST object:
-#     get_bars(...).df   list_positions()   get_position(sym)
-#     get_latest_trade(sym).price   submit_order(...)   close_position(sym)
-#     get_account()
-#  so the strategy code needs zero changes.
-#
-#  If you'd rather wire into v5's existing TradeStation layer than use this
-#  self-contained client, replace the method bodies with calls into that layer
-#  -- the signatures are what the engine depends on, not the internals.
+#  BROKER ADAPTER  --  TradeStation WebAPI v3   (from Algo 1 v5, unchanged)
 # =============================================================================
+
+def _to_utc_index(values):
+    """Coerce TS bar timestamps to a tz-aware UTC DatetimeIndex.
+
+    Why this is not a one-liner: pd.to_datetime(list, utc=True) infers ONE
+    format from the first element and raises if a later element differs.
+    TS normally sends '...Z' on every bar, but a single naive or offset-style
+    stamp in the batch would take the whole engine down mid-session -- and a
+    mixed naive/aware index goes object-dtype, which makes the
+    `newest <= last_bar_ts` compare raise TypeError instead. Cascade instead.
+    """
+    for kw in ({"format": "ISO8601"}, {"format": "mixed"}, {}):
+        try:
+            return pd.DatetimeIndex(pd.to_datetime(values, utc=True, **kw))
+        except (ValueError, TypeError):
+            continue
+    out = []
+    for v in values:                      # last resort: element by element
+        t = pd.Timestamp(v)
+        out.append(t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC"))
+    return pd.DatetimeIndex(out)
+
 
 TS_OAUTH_URL = "https://signin.tradestation.com/oauth/token"
 TS_BASE = {
@@ -156,7 +186,6 @@ TS_BASE = {
 }
 
 
-# lightweight attribute-style records so engine's pos.avg_entry_price etc. work
 @dataclass
 class _Position:
     symbol: str
@@ -182,7 +211,6 @@ class _Bars:
 
 class TradeStationClient:
     def __init__(self):
-        # env var names -- adjust the getenv keys to match what's in your .env
         self.client_id = os.getenv("TS_CLIENT_ID") or os.getenv("TRADESTATION_CLIENT_ID")
         self.client_secret = os.getenv("TS_CLIENT_SECRET") or os.getenv("TRADESTATION_CLIENT_SECRET")
         self.refresh_token = os.getenv("TS_REFRESH_TOKEN") or os.getenv("TRADESTATION_REFRESH_TOKEN")
@@ -210,7 +238,6 @@ class TradeStationClient:
 
     # ---- auth -----------------------------------------------------------
     def _access_token(self):
-        # refresh ~60s before the 1200s expiry TS grants
         if self._token and time.time() < self._token_exp - 60:
             return self._token
         log("Refreshing TradeStation access token...")
@@ -244,7 +271,6 @@ class TradeStationClient:
 
     # ---- market data ----------------------------------------------------
     def get_bars(self, symbol, tf=None, start=None, limit=None, feed=None):
-        # TS barcharts: interval + unit; returns Bars[] with UTC TimeStamp.
         params = {
             "interval": P.bar_minutes,
             "unit": "Minute",
@@ -254,10 +280,9 @@ class TradeStationClient:
         bars = data.get("Bars", [])
         if not bars:
             return _Bars(None)
-        rows = []
-        idx = []
+        rows, raw_ts = [], []
         for b in bars:
-            idx.append(pd.Timestamp(b["TimeStamp"]))  # ISO8601 UTC
+            raw_ts.append(b["TimeStamp"])
             rows.append({
                 "open":   float(b["Open"]),
                 "high":   float(b["High"]),
@@ -265,9 +290,7 @@ class TradeStationClient:
                 "close":  float(b["Close"]),
                 "volume": float(b.get("TotalVolume", 0) or 0),
             })
-        df = pd.DataFrame(rows, index=pd.DatetimeIndex(idx))
-        # TS may include the still-forming current bar; the Alpaca path only
-        # saw CLOSED bars. Drop the last row to match that, unless disabled.
+        df = pd.DataFrame(rows, index=_to_utc_index(raw_ts)).sort_index()
         if self.drop_forming_bar and len(df) > 1:
             df = df.iloc[:-1]
         return _Bars(df)
@@ -327,11 +350,9 @@ class TradeStationClient:
         return self._order(symbol, qty, action)
 
     def close_position(self, symbol):
-        # TS has no one-shot close; offset the held qty with a market order.
         pos = self.get_position(symbol)
         if pos.qty <= 0:
             return {"noop": True}
-        # long-only system (inverse ETFs are also long) -> SELL to close
         return self._order(symbol, pos.qty, "SELL")
 
 
@@ -339,8 +360,18 @@ class TradeStationClient:
 
 @dataclass
 class SymbolState:
-    armed_bars_left: int = 0
+    # --- arm/fire state machine (RSI system) ---
+    armed: bool = False
+    bars_since_arm: int = 0
+    black_low_since_arm: float = None
+    # --- bar bookkeeping ---
     last_bar_ts: pd.Timestamp = None
+    # --- status board fields ---
+    last_rsi: float = None
+    last_trend: float = None       # black % over trend_lookback bars
+    last_rose: float = None        # black % off its low since arm
+    bars_seen: int = 0
+    # --- position bookkeeping (Two Step) ---
     atr_at_entry: float = 0.0
     stop_level: float = 0.0
     entry_price: float = 0.0
@@ -351,11 +382,11 @@ class SymbolState:
 @dataclass
 class PairState:
     state: str = "FLAT"      # FLAT | LONG | INVERSE
-    symbol: str = None       # held ETF symbol
+    symbol: str = None
 
 
 class Portfolio:
-    """Slots + pair mutual-exclusion + stop-and-reverse (spec 10.1/10.2)."""
+    """Slots + pair mutual-exclusion + stop-and-reverse.  (Two Step)"""
 
     def __init__(self, api, sym_state):
         self.api = api
@@ -365,8 +396,10 @@ class Portfolio:
     def slots_used(self):
         return sum(1 for p in self.pairs if p.state != "FLAT")
 
-    def sync_from_broker(self):
-        """Reconcile internal state to actual TradeStation positions on startup."""
+    def sync_from_broker(self, quiet=False):
+        """Reconcile internal state to actual TradeStation positions.
+           Run at startup AND periodically -- this is what catches a manual
+           close the trader did by hand (replaces rsiAlgo's mark_flat)."""
         try:
             live = {p.symbol: p for p in self.api.list_positions()}
         except Exception as e:
@@ -375,24 +408,40 @@ class Portfolio:
         for i, pair in enumerate(PAIRS):
             long_s, inv_s = pair
             if long_s in live:
-                self.pairs[i] = PairState("LONG", long_s)
+                new = PairState("LONG", long_s)
             elif inv_s in live:
-                self.pairs[i] = PairState("INVERSE", inv_s)
+                new = PairState("INVERSE", inv_s)
             else:
-                self.pairs[i] = PairState("FLAT", None)
+                new = PairState("FLAT", None)
+            # detect a position that vanished on us (manual close / stop filled)
+            old = self.pairs[i]
+            if old.state != "FLAT" and new.state == "FLAT":
+                log(f"RESYNC {old.symbol} no longer held -- pair released, "
+                    f"engine will watch it again")
+                st = self.sym.get(old.symbol)
+                if st:
+                    st.stop_set = False
+                    st.stop_level = 0.0
+                    st.qty = 0
+                    st.entry_price = 0.0
+            self.pairs[i] = new
         for sym, pos in live.items():
             if sym not in self.sym:
                 continue
             st = self.sym[sym]
             st.entry_price = float(pos.avg_entry_price)
             st.qty = abs(int(float(pos.qty)))
-            st.atr_at_entry = st.atr_at_entry or 0.0
-        log(f"SYNC slots_used={self.slots_used()} pairs="
-            + ", ".join(f"{PAIRS[i][0]}/{PAIRS[i][1]}:{p.state}"
-                        for i, p in enumerate(self.pairs) if p.state != "FLAT"))
+        if not quiet:
+            log(f"SYNC slots_used={self.slots_used()} pairs="
+                + (", ".join(f"{PAIRS[i][0]}/{PAIRS[i][1]}:{p.state}"
+                             for i, p in enumerate(self.pairs) if p.state != "FLAT")
+                   or "none"))
 
     def _submit_buy(self, symbol, price, atr_val):
-        qty = max(1, int(P.money_per_position // price))
+        if P.fixed_shares > 0:
+            qty = P.fixed_shares
+        else:
+            qty = max(1, int(P.money_per_position // price))
         try:
             self.api.submit_order(symbol=symbol, qty=qty, side="buy",
                                   type="market", time_in_force="day")
@@ -423,7 +472,7 @@ class Portfolio:
         pair = self.pairs[i]
         side = SIDE_OF[symbol]
         if pair.state != "FLAT" and pair.symbol == symbol:
-            return  # already holding this side
+            return
         if pair.state == "FLAT":
             if self.slots_used() >= P.max_slots:
                 log(f"SLOT-SKIP {symbol} (slots full {P.max_slots})")
@@ -431,7 +480,6 @@ class Portfolio:
             if self._submit_buy(symbol, price, atr_val):
                 self.pairs[i] = PairState(side, symbol)
         else:
-            # opposite side held -> stop-and-reverse, reuse the slot
             log(f"REVERSE {pair.symbol} -> {symbol}")
             self._close(pair.symbol, "pair-reverse")
             if self._submit_buy(symbol, price, atr_val):
@@ -449,100 +497,7 @@ class Portfolio:
         return [p.symbol for p in self.pairs if p.state != "FLAT"]
 
 
-# ------------------------------------------------------------ signals -------
-
-def fetch_bars(api, symbol, feed):
-    bars = api.get_bars(symbol, start=None, limit=P.bar_lookback, feed=feed)
-    df = bars.df
-    if df is None or df.empty:
-        return None
-    return df[["open", "high", "low", "close", "volume"]].copy()
-
-
-def compute_signals(df):
-    """Return per-bar signal dict for the LAST closed bar, or None if short."""
-    need = P.ema_period + max(12, P.decel_window, P.chop_flip_lookback) + 5
-    if len(df) < need:
-        return None
-
-    c = df["close"]
-    rsi = rsi_wilder(c, P.rsi_period)
-    h = hma(c, P.hma_period)
-    e = ema(c, P.ema_period)
-    a = atr_wilder(df, P.atr_period)
-    atr_now = float(a.iloc[-1])
-    if atr_now <= 0:
-        return None
-
-    # ATR-normalized least-squares slopes (spec 5.7); 3-bar is diagnostic only
-    sl3 = float(linreg_slope(e, 3).iloc[-1]) / atr_now
-    sl6 = float(linreg_slope(e, P.block_window).iloc[-1]) / atr_now
-    s10_series = linreg_slope(e, P.decel_window) / atr_now
-    sl10 = float(s10_series.iloc[-1])
-    sl10_prev = float(s10_series.iloc[-2])
-    sl12 = float(linreg_slope(e, 12).iloc[-1]) / atr_now
-
-    # thresholds: degrees -> normalized slope (spec 6.4)
-    block_t = P.block_thresh_deg * P.slope_per_degree
-    sell_t = P.sell_thresh_deg * P.slope_per_degree
-
-    # Stage 1 arm trigger: RSI crosses up through arm level (spec 5.2)
-    rsi_cross_up = (rsi.iloc[-2] < P.rsi_arm_level <= rsi.iloc[-1])
-
-    # Stage 2 fire conditions
-    k = P.red_inflect_lookback
-    turn_up = (h.iloc[-1] - h.iloc[-1 - k] > 0) and \
-              (h.iloc[-2] - h.iloc[-2 - k] <= 0)
-    above_hma = c.iloc[-1] > h.iloc[-1]
-
-    # black-line entry blocker (spec 5.7)
-    blk_a = sl6 >= -block_t
-    blk_b = (sl10 >= 0) or (sl10 > sl10_prev)
-    black_ok = blk_a and blk_b
-
-    # chop filter (spec 5.6) on HMA, immune to EMA weighting
-    hd = np.sign(h.diff())
-    win = hd.iloc[-P.chop_flip_lookback:]
-    prev = hd.shift(1).iloc[-P.chop_flip_lookback:]
-    flips = int(((win != prev) & (win != 0) & (prev != 0)).sum())
-    hwin = h.iloc[-P.chop_flip_lookback:]
-    amp_ok = (hwin.max() - hwin.min()) >= P.min_swing_amp_atr * atr_now
-    chop_ok = (flips <= P.max_hma_flips) and amp_ok
-
-    # sell rule: 6-bar slope <= sell thresh for last N bars (spec 5.3/5.7)
-    s6_series = linreg_slope(e, P.sell_window) / atr_now
-    sell_now = bool((s6_series.iloc[-P.sell_consec_bars:] <= sell_t).all())
-
-    return {
-        "ts": df.index[-1],
-        "price": float(c.iloc[-1]),
-        "atr": atr_now,
-        "rsi": float(rsi.iloc[-1]),
-        "rsi_cross_up": bool(rsi_cross_up),
-        "turn_up": bool(turn_up),
-        "above_hma": bool(above_hma),
-        "black_ok": bool(black_ok),
-        "chop_ok": bool(chop_ok),
-        "sell_now": sell_now,
-        "sl3": sl3, "sl6": sl6, "sl10": sl10, "sl12": sl12,
-        "flips": flips,
-    }
-
-
 # ------------------------------------------------------------ indicators ----
-
-def wma(s: pd.Series, n: int) -> pd.Series:
-    w = np.arange(1, n + 1)
-    return s.rolling(n).apply(lambda x: np.dot(x, w) / w.sum(), raw=True)
-
-
-def hma(close: pd.Series, n: int) -> pd.Series:
-    # HMA = WMA( 2*WMA(c, n/2) - WMA(c, n), round(sqrt n) )  (spec 4.2)
-    half = max(1, int(n // 2))
-    sq = max(1, int(round(math.sqrt(n))))
-    raw = 2 * wma(close, half) - wma(close, n)
-    return wma(raw, sq)
-
 
 def ema(s: pd.Series, n: int) -> pd.Series:
     return s.ewm(span=n, adjust=False).mean()
@@ -566,12 +521,151 @@ def atr_wilder(df: pd.DataFrame, n: int) -> pd.Series:
 
 
 def linreg_slope(s: pd.Series, n: int) -> pd.Series:
+    """Only used when exit_mode='slope_decay'."""
     x = np.arange(n)
     xm = x.mean()
     denom = ((x - xm) ** 2).sum()
     def _slope(y):
         return ((x - xm) * (y - y.mean())).sum() / denom
     return s.rolling(n).apply(_slope, raw=True)
+
+
+# ------------------------------------------------------------ signals -------
+
+def bar_et(ts):
+    """Bar timestamp as ET HH:MM -- what you'd see on a TradeStation chart."""
+    try:
+        return pd.Timestamp(ts).tz_convert(ET).strftime("%H:%M")
+    except Exception:
+        return str(ts)
+
+
+def session_filter(df):
+    """Keep only bars inside 09:30-16:00 ET, on weekdays.
+
+    Filters by TIME OF DAY, not by date, so prior sessions' bars survive --
+    that's what lets the indicators be warm at 09:31 instead of waiting until
+    ~10:12 for 42 fresh bars. Same behavior as rsiAlgo's rolling deque.
+
+    NOTE: TradeStation's bar TimeStamp is the END of the bar period, so the
+    boundary is inclusive on both ends and a 09:30-stamped bar is the last
+    pre-market minute. One bar of EMA20 contamination per day; if you'd
+    rather be strict, change inclusive to "right".
+    """
+    if df is None or df.empty:
+        return df
+    et = df.tz_convert(ET)
+    try:
+        et = et.between_time(P.market_open_et, P.market_close_et, inclusive="both")
+    except TypeError:   # pandas < 1.4
+        et = et.between_time(P.market_open_et, P.market_close_et)
+    et = et[et.index.weekday < 5]
+    return et.tz_convert("UTC")
+
+
+def fetch_bars(api, symbol, feed=None):
+    bars = api.get_bars(symbol, start=None, limit=P.bar_lookback, feed=feed)
+    df = bars.df
+    if df is None or df.empty:
+        return None
+    if df.index.tz is None:                 # belt and braces
+        df = df.tz_localize("UTC")
+    if P.filter_bars_to_session:
+        df = session_filter(df)
+    if df is None or df.empty:
+        return None
+    return df[["open", "high", "low", "close", "volume"]].copy()
+
+
+WARMUP = max(20, 0)  # recomputed below once P exists in full
+
+
+def bars_needed():
+    return max(P.ema_period, P.atr_period, P.trend_lookback) + P.rsi_period + 5
+
+
+def compute_signals(df):
+    """Per-bar values for the LAST CLOSED bar, or None if not enough history.
+
+    Deliberately thin: RSI, the black line (EMA20), its trend, and ATR for
+    the stop. No HMA, no slope-degree blocker, no chop filter."""
+    if len(df) < bars_needed():
+        return None
+
+    c = df["close"]
+    rsi = rsi_wilder(c, P.rsi_period)
+    blk = ema(c, P.ema_period)
+    a = atr_wilder(df, P.atr_period)
+
+    atr_now = float(a.iloc[-1])
+    if atr_now <= 0:
+        return None
+
+    black = float(blk.iloc[-1])
+    past = float(blk.iloc[-1 - P.trend_lookback])
+    trend_pct = (black - past) / past * 100 if past else 0.0
+
+    sig = {
+        "ts": df.index[-1],
+        "price": float(c.iloc[-1]),
+        "atr": atr_now,
+        "rsi": float(rsi.iloc[-1]),
+        "rsi_prev": float(rsi.iloc[-2]),
+        "black": black,
+        "trend_pct": trend_pct,
+        "sell_now": False,
+    }
+
+    if P.exit_mode == "slope_decay":
+        s6 = linreg_slope(blk, P.sell_window) / atr_now
+        sell_t = P.sell_thresh_deg * P.slope_per_degree
+        sig["sell_now"] = bool((s6.iloc[-P.sell_consec_bars:] <= sell_t).all())
+        sig["sl6"] = float(s6.iloc[-1])
+
+    return sig
+
+
+# ------------------------------------------------------------ status --------
+
+def status_board(sym_state, pf, current_prices=None):
+    """What every ticker is doing right now.  (from rsiAlgo)
+         LONG      = held; work the sell by eye (unless exit_mode=slope_decay)
+         ARMED     = RSI crossed up; watching the black line rise
+         watch     = has data, waiting for an arm
+         (warming) = not enough bars yet
+    """
+    lines = ["", "===== STATUS BOARD =====",
+             "%-8s %-9s %6s %8s %8s  %s" % ("ticker", "state", "RSI", "trend%", "rose%", "note")]
+    held = {p.symbol for p in pf.pairs if p.state != "FLAT"}
+    for sym in SYMBOLS:
+        st = sym_state[sym]
+        rsi = "  -  " if st.last_rsi is None else "%5.1f" % st.last_rsi
+        trd = "   -  " if st.last_trend is None else "%+5.1f" % st.last_trend
+        rse = "   -  " if st.last_rose is None else "%+5.2f" % st.last_rose
+
+        if st.bars_seen < bars_needed():
+            state, note = "(warming)", "collecting bars (%d/%d)" % (st.bars_seen, bars_needed())
+        elif sym in held:
+            state = "LONG"
+            if current_prices and sym in current_prices and st.entry_price:
+                pnl = (current_prices[sym] / st.entry_price - 1) * 100
+                note = "in @ %.2f  now %+.1f%%  stop %.2f" % (
+                    st.entry_price, pnl, st.stop_level)
+            else:
+                note = "in @ %.2f  stop %.2f" % (st.entry_price or 0, st.stop_level)
+            if P.exit_mode == "stop_eod":
+                note += "  >>> CYBORG SELL by eye"
+        elif st.armed:
+            state = "ARMED"
+            note = "need black +%.2f%% off low (bar %d/%d)" % (
+                P.fire_distance_pct, st.bars_since_arm, P.arm_window)
+        else:
+            state, note = "watch", "waiting for RSI to cross up thru %.0f" % P.rsi_arm_level
+        lines.append("%-8s %-9s %6s %8s %8s  %s" % (sym, state, rsi, trd, rse, note))
+    lines.append("slots %d/%d   dry_run=%s" % (pf.slots_used(), P.max_slots,
+                                               pf.api.dry_run))
+    lines.append("========================")
+    log("\n".join(lines))
 
 
 # ------------------------------------------------------------ session -------
@@ -586,10 +680,10 @@ def et_now():
 
 
 def in_session(now_et):
-    o = now_et.replace(**dict(zip(("hour", "minute"), _hhmm(P.market_open_et))),
-                       second=0, microsecond=0)
-    c = now_et.replace(**dict(zip(("hour", "minute"), _hhmm(P.market_close_et))),
-                       second=0, microsecond=0)
+    oh, om = _hhmm(P.market_open_et)
+    ch, cm = _hhmm(P.market_close_et)
+    o = now_et.replace(hour=oh, minute=om, second=0, microsecond=0)
+    c = now_et.replace(hour=ch, minute=cm, second=0, microsecond=0)
     return o <= now_et <= c and now_et.weekday() < 5
 
 
@@ -612,16 +706,36 @@ def _stop(*_):
 
 def main():
     load_dotenv()
-    api = TradeStationClient()   # reads TS_* creds + TS_ENV + DRY_RUN from .env
+    api = TradeStationClient()
+
+    # ---- clock diagnostic: if anything is off, it shows up right here ----
+    _u = datetime.now(timezone.utc)
+    log("CLOCK  utc=%s | et=%s | az=%s | host_tz=%s"
+        % (_u.strftime("%Y-%m-%d %H:%M:%S"),
+           _u.astimezone(ET).strftime("%H:%M:%S %Z"),
+           _u.astimezone(AZ).strftime("%H:%M:%S %Z"),
+           "/".join(time.tzname)))
+    log("       session gate uses ET. Bars are stamped UTC by TS and "
+        "filtered to %s-%s ET before any indicator sees them (filter=%s)."
+        % (P.market_open_et, P.market_close_et, P.filter_bars_to_session))
 
     acct = api.get_account()
-    log(f"START RSI System v1.2 [TradeStation/{api.env}] "
+    log(f"START RSI System [persistent fire] [TradeStation/{api.env}] "
         f"account={acct.account_number} status={acct.status} "
         f"dry_run={api.dry_run} bars={P.bar_minutes}min "
         f"symbols={len(SYMBOLS)} | log={_log_path}")
+    log(f"SIGNAL arm=RSI{P.rsi_period} cross up thru {P.rsi_arm_level:.0f} | "
+        f"fire=black(EMA{P.ema_period}) +{P.fire_distance_pct}% off low "
+        f"within {P.arm_window} bars | "
+        f"trend_gate={'+%.1f%%/%db' % (P.trend_gate_pct, P.trend_lookback) if P.use_trend_gate else 'OFF'}")
+    log(f"EXEC   exit_mode={P.exit_mode} stop={P.stop_mult_atr}xATR "
+        f"slots={P.max_slots} "
+        f"size={'%d sh fixed' % P.fixed_shares if P.fixed_shares > 0 else '$%.0f' % P.money_per_position}")
     if api.env == "live" and not api.dry_run:
         log("*** LIVE TRADING ENABLED -- real orders will be sent ***")
-    log("CALIBRATION REMINDER: slope_per_degree is a placeholder (spec 6).")
+    if P.exit_mode == "slope_decay":
+        log("WARN exit_mode=slope_decay uses slope_per_degree, which is a "
+            "PLACEHOLDER (0.0025). Calibrate before trusting the exits.")
 
     sym_state = {s: SymbolState() for s in SYMBOLS}
     pf = Portfolio(api, sym_state)
@@ -630,6 +744,9 @@ def main():
     _sig.signal(_sig.SIGINT, _stop)
     _sig.signal(_sig.SIGTERM, _stop)
 
+    last_status = 0.0
+    last_resync = time.time()
+
     while _RUNNING:
         now_et = et_now()
 
@@ -637,14 +754,20 @@ def main():
             time.sleep(P.poll_seconds)
             continue
 
-        # ---- EOD flatten (spec 5.5): highest priority -------------------
+        # ---- EOD flatten: highest priority ------------------------------
         if past(now_et, P.flatten_at_et):
             for sym in list(pf.held_symbols()):
                 pf.on_exit(sym, "EOD-flatten")
             time.sleep(P.poll_seconds)
             continue
 
-        # ---- fast hard-stop check between bars (spec 5.4) ---------------
+        # ---- periodic broker resync (catches manual closes) -------------
+        if P.resync_every_seconds and time.time() - last_resync >= P.resync_every_seconds:
+            pf.sync_from_broker(quiet=True)
+            last_resync = time.time()
+
+        # ---- fast hard-stop check between bars --------------------------
+        live_px = {}
         for sym in list(pf.held_symbols()):
             st = sym_state[sym]
             if not st.stop_set:
@@ -653,6 +776,7 @@ def main():
                 last = float(api.get_latest_trade(sym).price)
             except Exception:
                 continue
+            live_px[sym] = last
             if last <= st.stop_level:
                 log(f"STOP   {sym} px={last:.2f} <= stop={st.stop_level:.2f}")
                 pf.on_exit(sym, "hard-stop")
@@ -662,7 +786,7 @@ def main():
         # ---- per-symbol bar evaluation ----------------------------------
         for sym in SYMBOLS:
             try:
-                df = fetch_bars(api, sym, None)
+                df = fetch_bars(api, sym)
             except Exception as e:
                 log(f"DATA-ERR {sym}: {e}")
                 continue
@@ -670,11 +794,13 @@ def main():
                 continue
 
             st = sym_state[sym]
+            st.bars_seen = len(df)
             newest = df.index[-1]
-
-            # set/refresh stop once the fill's avg price is known
             i = PAIR_OF[sym]
-            if pf.pairs[i].symbol == sym and not st.stop_set:
+            held_here = pf.pairs[i].symbol == sym
+
+            # set the stop once the fill's avg price is known
+            if held_here and not st.stop_set:
                 try:
                     pos = api.get_position(sym)
                     st.entry_price = float(pos.avg_entry_price)
@@ -685,47 +811,91 @@ def main():
                 except Exception:
                     pass
 
-            if st.last_bar_ts is not None and newest <= st.last_bar_ts:
-                continue  # no new closed bar for this symbol
+            # one evaluation per closed bar
+            if st.last_bar_ts is not None:
+                try:
+                    if newest <= st.last_bar_ts:
+                        continue
+                except TypeError:
+                    # naive/aware mismatch -- shouldn't happen now, but never
+                    # let it take the whole engine down mid-session
+                    log(f"TZ-WARN {sym} bar ts mismatch "
+                        f"({newest!r} vs {st.last_bar_ts!r}); resetting")
+                    st.last_bar_ts = None
+                    continue
             st.last_bar_ts = newest
 
             sig = compute_signals(df)
             if sig is None:
                 continue
 
-            # Stage 1: arm on RSI cross-up (spec 5.2)
-            if sig["rsi_cross_up"]:
-                st.armed_bars_left = P.armed_window
-                log(f"ARMED  {sym} rsi={sig['rsi']:.1f} window={P.armed_window}")
-            is_armed = st.armed_bars_left > 0
+            # status-board fields update every bar, held or not
+            st.last_rsi = sig["rsi"]
+            st.last_trend = sig["trend_pct"]
 
-            held_here = pf.pairs[i].symbol == sym
+            black = sig["black"]
 
-            # Exit logic for a held symbol (slope decay) -- stop/EOD handled above
-            if held_here and sig["sell_now"]:
-                log(f"SELL   {sym} sl6={sig['sl6']:.5f} "
-                    f"thresh={P.sell_thresh_deg * P.slope_per_degree:.5f}")
-                pf.on_exit(sym, "slope-decay")
-                st.armed_bars_left = max(0, st.armed_bars_left - 1)
+            # ---- held: exit logic only ----------------------------------
+            if held_here:
+                st.armed = False
+                st.last_rose = None
+                if P.exit_mode == "slope_decay" and sig["sell_now"]:
+                    log(f"SELL   {sym} sl6={sig.get('sl6', 0):.5f}")
+                    pf.on_exit(sym, "slope-decay")
                 continue
 
-            # Stage 2: fire (spec 5.2) -- only if not already holding this side
-            fire = (is_armed and sig["turn_up"] and sig["above_hma"]
-                    and sig["black_ok"] and sig["chop_ok"]
-                    and not no_new_entries and not held_here)
+            # ================= RSI SYSTEM ARM -> FIRE ====================
+            # ---- ARM: RSI crosses UP through level ----
+            if (not st.armed) and sig["rsi_prev"] < P.rsi_arm_level <= sig["rsi"]:
+                st.armed = True
+                st.bars_since_arm = 0
+                st.black_low_since_arm = black
+                st.last_rose = 0.0
+                log(f"ARMED  {sym} [{bar_et(sig['ts'])} ET] "
+                    f"rsi {sig['rsi_prev']:.1f}->{sig['rsi']:.1f} "
+                    f"black={black:.4f} window={P.arm_window}b")
+                continue
 
-            if is_armed and sig["turn_up"]:
-                log(f"EVAL   {sym} turnUp={sig['turn_up']} "
-                    f"aboveHMA={sig['above_hma']} black={sig['black_ok']} "
-                    f"chop={sig['chop_ok']} flips={sig['flips']} "
-                    f"sl3={sig['sl3']:.5f} sl6={sig['sl6']:.5f} "
-                    f"sl10={sig['sl10']:.5f} sl12={sig['sl12']:.5f}")
+            if st.armed:
+                st.bars_since_arm += 1
+                st.black_low_since_arm = min(st.black_low_since_arm, black)
 
-            if fire:
-                pf.on_fire(sym, sig["price"], sig["atr"])
-                st.armed_bars_left = 0
-            elif st.armed_bars_left > 0:
-                st.armed_bars_left -= 1
+                if st.bars_since_arm > P.arm_window:
+                    st.armed = False
+                    st.last_rose = None
+                    log(f"DISARM {sym} arm window expired ({P.arm_window}b, "
+                        f"best rise never hit {P.fire_distance_pct}%)")
+                    continue
+
+                # ---- FIRE: black rose fire_distance% off its low since arm ----
+                low = st.black_low_since_arm
+                rose = (black - low) / low * 100 if low else 0.0
+                st.last_rose = rose
+
+                log(f"EVAL   {sym} [{bar_et(sig['ts'])} ET] "
+                    f"bar {st.bars_since_arm}/{P.arm_window} "
+                    f"rsi={sig['rsi']:.1f} black={black:.4f} low={low:.4f} "
+                    f"rose={rose:+.2f}% (need +{P.fire_distance_pct}%) "
+                    f"trend={sig['trend_pct']:+.2f}%")
+
+                if rose >= P.fire_distance_pct:
+                    st.armed = False        # arm is consumed either way
+                    st.last_rose = None
+
+                    if P.use_trend_gate and sig["trend_pct"] < P.trend_gate_pct:
+                        log(f"SKIP   {sym} trend gate: {sig['trend_pct']:+.2f}% "
+                            f"< {P.trend_gate_pct}% over {P.trend_lookback}b")
+                        continue
+                    if no_new_entries:
+                        log(f"SKIP   {sym} past no-entry cutoff {P.no_entry_after_et} ET")
+                        continue
+
+                    pf.on_fire(sym, sig["price"], sig["atr"])
+
+        # ---- status board -----------------------------------------------
+        if P.status_every_seconds and time.time() - last_status >= P.status_every_seconds:
+            status_board(sym_state, pf, live_px)
+            last_status = time.time()
 
         time.sleep(P.poll_seconds)
 
