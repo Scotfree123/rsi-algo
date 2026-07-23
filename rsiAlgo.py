@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 # =============================================================================
 #  RSI SYSTEM  --  persistent arm->fire signals + Two Step execution
@@ -211,8 +212,12 @@ class _Bars:
 
 class TradeStationClient:
     def __init__(self):
-        self.client_id = os.getenv("TS_CLIENT_ID") or os.getenv("TRADESTATION_CLIENT_ID")
-        self.client_secret = os.getenv("TS_CLIENT_SECRET") or os.getenv("TRADESTATION_CLIENT_SECRET")
+        # Several naming conventions accepted -- the .env already on the box
+        # predates this script and uses TS_API_KEY / TS_SECRET.
+        self.client_id = (os.getenv("TS_CLIENT_ID") or os.getenv("TS_API_KEY")
+                          or os.getenv("TRADESTATION_CLIENT_ID"))
+        self.client_secret = (os.getenv("TS_CLIENT_SECRET") or os.getenv("TS_SECRET")
+                              or os.getenv("TRADESTATION_CLIENT_SECRET"))
         self.refresh_token = os.getenv("TS_REFRESH_TOKEN") or os.getenv("TRADESTATION_REFRESH_TOKEN")
         self.account_id = os.getenv("TS_ACCOUNT_ID") or os.getenv("TRADESTATION_ACCOUNT_ID")
         self.env = (os.getenv("TS_ENV") or "sim").lower()
@@ -224,8 +229,8 @@ class TradeStationClient:
         self.base = TS_BASE[self.env]
 
         missing = [k for k, v in {
-            "TS_CLIENT_ID": self.client_id,
-            "TS_CLIENT_SECRET": self.client_secret,
+            "TS_CLIENT_ID (or TS_API_KEY)": self.client_id,
+            "TS_CLIENT_SECRET (or TS_SECRET)": self.client_secret,
             "TS_REFRESH_TOKEN": self.refresh_token,
             "TS_ACCOUNT_ID": self.account_id,
         }.items() if not v]
