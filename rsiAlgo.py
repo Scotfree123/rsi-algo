@@ -60,18 +60,46 @@ from dotenv import load_dotenv
 AZ = ZoneInfo("America/Phoenix")     # log/display timezone
 ET = ZoneInfo("America/New_York")    # session gating (exchange time)
 
+# Each entry is a GROUP that can hold at most one position at a time.
+#   ("LONG", "INVERSE")  -- mutually exclusive; firing one reverses the other
+#   ("SOLO",)            -- no inverse counterpart; just occupies a slot
+#
+# One group == one slot. 10 groups here, so the slot ceiling is 10.
+#
+# !! VERIFY BEFORE TRADING !!  The pairings marked below are inferred from
+# the ticker naming, not from anything authoritative. A wrong pairing means
+# the engine will "reverse" into a security that is not actually the inverse.
+# Run the symbol check (see chat) before this goes anywhere near live.
 PAIRS = [
-    ("RGTX", "RGTZ"),
-    ("NBIL", "NBIZ"),
-    ("APLX", "APLZ"),
-    ("IRE",  "IREZ"),   # verify ticker resolution
-    ("MSTU", "MSTZ"),
-    ("CRWV", "CORD"),   # verify pairing
+    ("ASTX", "ASTZ"),      # X/Z convention
+    ("MSTU", "MSTZ"),      # carried over, previously in use
+    ("NBIL", "NBIZ"),      # carried over, previously in use
+    ("RKLX", "RKLZ"),      # X/Z convention
+    ("SOXL", "SOXS"),      # Direxion semis bull/bear
+    ("CWVX", "CORD"),      # INFERRED -- confirm CORD is CWVX's counterpart
+    ("SNXX", "SNDR"),      # INFERRED -- confirm these are actually a pair
+    ("AAOX",),             # unpaired -- no counterpart given
+    ("LITX",),             # unpaired -- LITZ not in your list
+    ("BEX",),              # unpaired -- no counterpart given
 ]
-SYMBOLS = [s for pair in PAIRS for s in pair]
-PAIR_OF = {s: i for i, pair in enumerate(PAIRS) for s in pair}
-SIDE_OF = {pair[0]: "LONG" for pair in PAIRS}
-SIDE_OF.update({pair[1]: "INVERSE" for pair in PAIRS})
+
+# --- derived; handles 1- and 2-symbol groups -------------------------------
+SYMBOLS = [s for group in PAIRS for s in group]
+PAIR_OF = {s: i for i, group in enumerate(PAIRS) for s in group}
+SIDE_OF = {}
+for _g in PAIRS:
+    SIDE_OF[_g[0]] = "LONG"
+    if len(_g) > 1:
+        SIDE_OF[_g[1]] = "INVERSE"
+
+_dupes = [s for s in set(SYMBOLS) if SYMBOLS.count(s) > 1]
+if _dupes:
+    raise SystemExit(f"FATAL: duplicate symbols in PAIRS: {sorted(_dupes)}")
+
+
+def group_label(i):
+    """'ASTX/ASTZ' or 'AAOX' -- for logs."""
+    return "/".join(PAIRS[i])
 
 
 @dataclass
@@ -98,8 +126,32 @@ class Params:
     atr_period: int = 14
     stop_mult_atr: float = 1.5
     money_per_position: float = 10_000.0
-    fixed_shares: int = 0          # >0 overrides money sizing (use 1 for a live toe-dip)
-    max_slots: int = 3
+    fixed_shares: int = 1          # >0 overrides money sizing (1 = live toe-dip)
+    # NOTE: slots count GROUPS, not symbols. 10 groups here -> ceiling 10.
+    # 25 concurrent would need 25 groups in PAIRS.
+    max_slots: int = 10
+
+    # Hard stop is 1.5xATR by default. On a quiet tape ATR can be tiny and the
+    # stop lands a few cents away; on a wild one it can land 10% out. This
+    # clamps it into a band you can reason about. 0 disables either end.
+    stop_min_pct: float = 1.0      # never tighter than this % below entry
+    stop_max_pct: float = 4.0      # never wider than this % below entry
+
+    # ---- conservative auto-exits (backstops to the cyborg sell) ---------
+    # These exist so a position is never fully unmanaged. Tuned to fire
+    # RARELY -- if one trips before you sell by eye, it cost you the trade.
+    use_trail: bool = True
+    trail_arm_pct: float = 1.0     # don't trail until up this much from entry
+    trail_giveback_pct: float = 2.0  # then exit on this much off the peak
+
+    use_time_stop: bool = True
+    time_stop_bars: int = 90       # bars held...
+    time_stop_only_if_losing: bool = True   # ...and only if flat-or-down
+
+    # ---- broker-side protective stop ------------------------------------
+    # The ONLY exit that survives this process dying. Resting GTC stop order
+    # placed at the broker on entry, cancelled on any other exit.
+    use_broker_stop: bool = True
 
     # exit rule: "stop_eod" = hard stop + EOD flatten only, trader works the
     # profit exit by hand (the RSI system's cyborg design).
@@ -308,12 +360,42 @@ class TradeStationClient:
 
     # ---- brokerage ------------------------------------------------------
     def get_account(self):
+        """Resolve the account for THIS environment.
+
+        sim and live have different account numbers, so a single
+        TS_ACCOUNT_ID in .env cannot serve both. Previously a mismatch fell
+        back silently here while list_positions() kept using the raw .env
+        value -- startup logged a plausible account and every positions call
+        403'd. Adopt the resolved id so the rest of the client follows."""
         data = self._get("/brokerage/accounts")
         accts = data.get("Accounts", [])
-        me = next((a for a in accts if a.get("AccountID") == self.account_id),
-                  accts[0] if accts else {})
+        me = next((a for a in accts if a.get("AccountID") == self.account_id), None)
+        if me is None and accts:
+            # prefer a Margin account -- equities do not live in Futures
+            me = next((a for a in accts
+                       if str(a.get("AccountType", "")).lower() == "margin"), accts[0])
+            log(f"WARN TS_ACCOUNT_ID={self.account_id!r} not found in "
+                f"env={self.env}. Using {me.get('AccountID')} "
+                f"(type={me.get('AccountType')}) instead. Fix .env to silence this.")
+            self.account_id = me.get("AccountID")
+        me = me or {}
         return _Account(me.get("AccountID", self.account_id),
                         me.get("Status", "UNKNOWN"))
+
+    def get_balance(self):
+        """Cash/equity for the resolved account -- used to sanity-check that
+        you are pointed at the account you think you are."""
+        try:
+            data = self._get(f"/brokerage/accounts/{self.account_id}/balances")
+            b = (data.get("Balances") or [{}])[0]
+            return {
+                "equity": float(b.get("Equity", 0) or 0),
+                "cash": float(b.get("CashBalance", 0) or 0),
+                "buying_power": float(b.get("BuyingPower", 0) or 0),
+            }
+        except Exception as e:
+            log(f"WARN could not read balances: {e}")
+            return None
 
     def list_positions(self):
         data = self._get(f"/brokerage/accounts/{self.account_id}/positions")
@@ -354,11 +436,75 @@ class TradeStationClient:
         action = "BUY" if side.lower() == "buy" else "SELL"
         return self._order(symbol, qty, action)
 
-    def close_position(self, symbol):
+    def close_position(self, symbol, qty=None):
+        """Market sell to flat.
+
+        In dry-run there is no broker position to look up, so we take the qty
+        the engine thinks it holds. Previously this called get_position(),
+        which raised in dry-run -- the exception surfaced as ORDER-ERR and the
+        exit never completed. That is why no exit path had ever run."""
+        if self.dry_run:
+            log(f"DRY-RUN order suppressed: SELL {qty or 0} {symbol}")
+            return {"dry_run": True}
         pos = self.get_position(symbol)
         if pos.qty <= 0:
             return {"noop": True}
         return self._order(symbol, pos.qty, "SELL")
+
+    # ---- resting protective stop (survives this process dying) ----------
+    def submit_stop_order(self, symbol, qty, stop_price):
+        """GTC StopMarket SELL resting at the broker.
+
+        This is the only exit that still exists if the box reboots, the
+        network drops, or python dies. Returns the order id, or None."""
+        body = {
+            "AccountID": self.account_id,
+            "Symbol": symbol,
+            "Quantity": str(int(qty)),
+            "OrderType": "StopMarket",
+            "StopPrice": f"{stop_price:.2f}",
+            "TradeAction": "SELL",
+            "TimeInForce": {"Duration": "GTC"},
+            "Route": "Intelligent",
+        }
+        if self.dry_run:
+            log(f"DRY-RUN broker stop suppressed: SELL {qty} {symbol} "
+                f"stop {stop_price:.2f} GTC")
+            return None
+        resp = self._post("/orderexecution/orders", body)
+        oid = None
+        for o in (resp.get("Orders") or []):
+            oid = o.get("OrderID") or o.get("OrderId")
+            if oid:
+                break
+        return oid or resp.get("OrderID") or resp.get("OrderId")
+
+    def cancel_order(self, order_id):
+        """Cancel a resting order. Must be called on every non-stop exit or
+        the orphan will sell you short on a later rally."""
+        if self.dry_run or not order_id:
+            return {"dry_run": True}
+        r = self._session.delete(f"{self.base}/orderexecution/orders/{order_id}",
+                                 headers=self._headers(), timeout=20)
+        r.raise_for_status()
+        return r.json() if r.content else {}
+
+
+# ------------------------------------------------------------ stops ---------
+
+def clamp_stop(entry_price, atr_val):
+    """Hard stop = entry - stop_mult_atr*ATR, clamped into a % band.
+
+    Raw ATR stops are unusable across a mixed universe: on a quiet 1-min tape
+    1.5xATR can be 0.15% away (you get stopped on noise), and on a leveraged
+    name in a flush it can be 9% away (the 'stop' is theatre). The band makes
+    one setting behave sanely on both."""
+    stop = entry_price - P.stop_mult_atr * float(atr_val or 0.0)
+    if P.stop_max_pct:                      # not wider than X% below entry
+        stop = max(stop, entry_price * (1 - P.stop_max_pct / 100.0))
+    if P.stop_min_pct:                      # not tighter than X% below entry
+        stop = min(stop, entry_price * (1 - P.stop_min_pct / 100.0))
+    return stop
 
 
 # ------------------------------------------------------------ state ----------
@@ -382,6 +528,14 @@ class SymbolState:
     entry_price: float = 0.0
     qty: int = 0
     stop_set: bool = False
+    # entry_price came from the signal bar, not a confirmed fill. Stays True
+    # for the whole trade in dry-run (there is no fill to confirm against).
+    provisional_entry: bool = False
+    # --- conservative exit bookkeeping ---
+    peak_price: float = 0.0        # high-water mark since entry
+    trail_armed: bool = False      # gain cleared trail_arm_pct at least once
+    bars_held: int = 0
+    stop_order_id: str = None      # resting broker-side stop, if any
 
 
 @dataclass
@@ -405,16 +559,26 @@ class Portfolio:
         """Reconcile internal state to actual TradeStation positions.
            Run at startup AND periodically -- this is what catches a manual
            close the trader did by hand (replaces rsiAlgo's mark_flat)."""
+        # In dry-run no order was ever sent, so the broker reports nothing and
+        # this would mark every pair FLAT -- silently deleting the simulated
+        # positions every resync_every_seconds. Until now the 403 on the
+        # positions endpoint was the only thing preventing that. Skip it.
+        if self.api.dry_run:
+            if not quiet:
+                log("SYNC skipped (dry_run): broker has no simulated positions "
+                    "to reconcile against")
+            return
         try:
             live = {p.symbol: p for p in self.api.list_positions()}
         except Exception as e:
             log(f"WARN could not list positions: {e}")
             return
-        for i, pair in enumerate(PAIRS):
-            long_s, inv_s = pair
+        for i, group in enumerate(PAIRS):
+            long_s = group[0]
+            inv_s = group[1] if len(group) > 1 else None
             if long_s in live:
                 new = PairState("LONG", long_s)
-            elif inv_s in live:
+            elif inv_s and inv_s in live:
                 new = PairState("INVERSE", inv_s)
             else:
                 new = PairState("FLAT", None)
@@ -438,7 +602,7 @@ class Portfolio:
             st.qty = abs(int(float(pos.qty)))
         if not quiet:
             log(f"SYNC slots_used={self.slots_used()} pairs="
-                + (", ".join(f"{PAIRS[i][0]}/{PAIRS[i][1]}:{p.state}"
+                + (", ".join(f"{group_label(i)}:{p.state}"
                              for i, p in enumerate(self.pairs) if p.state != "FLAT")
                    or "none"))
 
@@ -456,21 +620,70 @@ class Portfolio:
         st = self.sym[symbol]
         st.atr_at_entry = atr_val
         st.qty = qty
-        st.stop_set = False
-        log(f"FIRE   {symbol} buy qty={qty} ~px={price:.2f} atr={atr_val:.4f}")
+
+        # --- entry price and stop are set NOW, from the signal bar. -------
+        # Previously both waited on api.get_position(), which never returns
+        # in dry-run and 403s in sim -- so entry_price stayed 0.0, stop_level
+        # stayed 0.0, stop_set stayed False, and the hard stop was dead code.
+        # The broker fill (if any) refines this later; see main().
+        st.entry_price = float(price)
+        st.stop_level = clamp_stop(st.entry_price, atr_val)
+        st.stop_set = True
+        st.provisional_entry = True
+        st.peak_price = float(price)
+        st.trail_armed = False
+        st.bars_held = 0
+        st.stop_order_id = None
+
+        log(f"FIRE   {symbol} buy qty={qty} in @ {st.entry_price:.2f} "
+            f"stop {st.stop_level:.2f} atr={atr_val:.4f}")
+
+        # --- resting protective stop at the broker -----------------------
+        if P.use_broker_stop:
+            try:
+                st.stop_order_id = self.api.submit_stop_order(
+                    symbol, qty, st.stop_level)
+                if st.stop_order_id:
+                    log(f"BSTOP  {symbol} resting GTC stop {st.stop_level:.2f} "
+                        f"id={st.stop_order_id}")
+            except Exception as e:
+                log(f"BSTOP-ERR {symbol}: {e} -- position has NO broker-side "
+                    f"protection, client-side stop only")
         return True
 
     def _close(self, symbol, reason):
+        st = self.sym[symbol]
+
+        # Cancel the resting stop FIRST. If the market sell fills and the GTC
+        # stop is still live, it stays working and will short you on a rally.
+        if st.stop_order_id:
+            try:
+                self.api.cancel_order(st.stop_order_id)
+                log(f"BSTOP  {symbol} resting stop cancelled "
+                    f"(id={st.stop_order_id})")
+            except Exception as e:
+                log(f"BSTOP-ERR {symbol} cancel failed: {e} -- CHECK FOR AN "
+                    f"ORPHANED STOP ORDER AT THE BROKER")
+            st.stop_order_id = None
+
         try:
-            self.api.close_position(symbol)
+            self.api.close_position(symbol, qty=st.qty)
         except Exception as e:
             log(f"ORDER-ERR close {symbol}: {e}")
             return
-        st = self.sym[symbol]
+
+        pnl_txt = ""
+        if st.entry_price and st.peak_price:
+            pnl_txt = (f" entry={st.entry_price:.2f} peak={st.peak_price:.2f} "
+                       f"bars={st.bars_held}")
         st.stop_level = 0.0
         st.stop_set = False
         st.qty = 0
-        log(f"EXIT   {symbol} ({reason})")
+        st.provisional_entry = False
+        st.peak_price = 0.0
+        st.trail_armed = False
+        st.bars_held = 0
+        log(f"EXIT   {symbol} ({reason}){pnl_txt}")
 
     def on_fire(self, symbol, price, atr_val):
         i = PAIR_OF[symbol]
@@ -658,6 +871,20 @@ def status_board(sym_state, pf, current_prices=None):
                     st.entry_price, pnl, st.stop_level)
             else:
                 note = "in @ %.2f  stop %.2f" % (st.entry_price or 0, st.stop_level)
+            if st.provisional_entry:
+                note += "*"          # * = signal-bar price, fill unconfirmed
+            if P.use_trail and st.peak_price:
+                if st.trail_armed and current_prices and sym in current_prices:
+                    give = (st.peak_price - current_prices[sym]) / st.peak_price * 100
+                    note += "  peak %.2f (-%.2f%%/%.1f%%)" % (
+                        st.peak_price, give, P.trail_giveback_pct)
+                else:
+                    note += "  peak %.2f (trail@+%.1f%%)" % (
+                        st.peak_price, P.trail_arm_pct)
+            if P.use_time_stop:
+                note += "  %db/%db" % (st.bars_held, P.time_stop_bars)
+            if st.stop_order_id:
+                note += "  [bstop]"
             if P.exit_mode == "stop_eod":
                 note += "  >>> CYBORG SELL by eye"
         elif st.armed:
@@ -729,13 +956,30 @@ def main():
         f"account={acct.account_number} status={acct.status} "
         f"dry_run={api.dry_run} bars={P.bar_minutes}min "
         f"symbols={len(SYMBOLS)} | log={_log_path}")
+    bal = api.get_balance()
+    if bal:
+        log(f"BALANCE equity=${bal['equity']:,.2f} cash=${bal['cash']:,.2f} "
+            f"buying_power=${bal['buying_power']:,.2f}")
+        if api.env == "live" and not api.dry_run:
+            log("       ^ CHECK THIS NUMBER. If it is not the account you "
+                "meant to trade, Ctrl-C now.")
     log(f"SIGNAL arm=RSI{P.rsi_period} cross up thru {P.rsi_arm_level:.0f} | "
         f"fire=black(EMA{P.ema_period}) +{P.fire_distance_pct}% off low "
         f"within {P.arm_window} bars | "
         f"trend_gate={'+%.1f%%/%db' % (P.trend_gate_pct, P.trend_lookback) if P.use_trend_gate else 'OFF'}")
     log(f"EXEC   exit_mode={P.exit_mode} stop={P.stop_mult_atr}xATR "
+        f"clamped {P.stop_min_pct}-{P.stop_max_pct}% "
         f"slots={P.max_slots} "
         f"size={'%d sh fixed' % P.fixed_shares if P.fixed_shares > 0 else '$%.0f' % P.money_per_position}")
+    log(f"EXITS  trail={'-%.1f%% off peak, arms at +%.1f%%' % (P.trail_giveback_pct, P.trail_arm_pct) if P.use_trail else 'OFF'} | "
+        f"time={'%db%s' % (P.time_stop_bars, ' if losing' if P.time_stop_only_if_losing else '') if P.use_time_stop else 'OFF'} | "
+        f"broker_stop={'GTC at broker' if P.use_broker_stop else 'OFF'}")
+    if P.max_slots > len(PAIRS):
+        log(f"WARN max_slots={P.max_slots} but only {len(PAIRS)} pairs exist -- "
+            f"the real ceiling is {len(PAIRS)}. Add pairs to PAIRS to raise it.")
+    if P.use_broker_stop and api.dry_run:
+        log("NOTE dry_run: no resting broker stop is placed. The exit that "
+            "survives a crash is the one thing dry-run cannot test.")
     if api.env == "live" and not api.dry_run:
         log("*** LIVE TRADING ENABLED -- real orders will be sent ***")
     if P.exit_mode == "slope_decay":
@@ -782,9 +1026,34 @@ def main():
             except Exception:
                 continue
             live_px[sym] = last
+
+            # high-water mark, updated between bars so a spike counts
+            if last > st.peak_price:
+                st.peak_price = last
+
+            # ---- hard stop (client side; broker also holds a resting one) --
             if last <= st.stop_level:
                 log(f"STOP   {sym} px={last:.2f} <= stop={st.stop_level:.2f}")
                 pf.on_exit(sym, "hard-stop")
+                continue
+
+            # ---- trailing giveback from the peak --------------------------
+            # Conservative by design: dormant until the trade has proved
+            # itself by trail_arm_pct, then only acts after a real reversal.
+            # It should almost never beat you to the cyborg sell.
+            if P.use_trail and st.entry_price:
+                gain = (last - st.entry_price) / st.entry_price * 100.0
+                if not st.trail_armed and gain >= P.trail_arm_pct:
+                    st.trail_armed = True
+                    log(f"TRAIL  {sym} armed at {gain:+.2f}% "
+                        f"(gives back {P.trail_giveback_pct}% off peak)")
+                if st.trail_armed and st.peak_price > 0:
+                    give = (st.peak_price - last) / st.peak_price * 100.0
+                    if give >= P.trail_giveback_pct:
+                        log(f"TRAIL  {sym} px={last:.2f} is -{give:.2f}% off "
+                            f"peak {st.peak_price:.2f}")
+                        pf.on_exit(sym, "trail-giveback")
+                        continue
 
         no_new_entries = past(now_et, P.no_entry_after_et)
 
@@ -804,17 +1073,38 @@ def main():
             i = PAIR_OF[sym]
             held_here = pf.pairs[i].symbol == sym
 
-            # set the stop once the fill's avg price is known
-            if held_here and not st.stop_set:
+            # ---- refine the provisional entry with the real fill ---------
+            # entry_price/stop_level are already set from the signal bar, so
+            # this only upgrades them. If it fails (dry-run, or the 403 on the
+            # positions endpoint) the provisional values stand and the stop
+            # still works -- unlike before, where failure here left the stop
+            # at 0.00 forever. The failure is now logged, not swallowed.
+            if held_here and st.provisional_entry and not api.dry_run:
                 try:
                     pos = api.get_position(sym)
-                    st.entry_price = float(pos.avg_entry_price)
-                    st.stop_level = st.entry_price - P.stop_mult_atr * st.atr_at_entry
-                    st.stop_set = True
-                    log(f"ENTERED {sym} entry={st.entry_price:.2f} "
-                        f"atr@entry={st.atr_at_entry:.4f} stop={st.stop_level:.2f}")
-                except Exception:
-                    pass
+                    real = float(pos.avg_entry_price)
+                    if real > 0:
+                        drift = abs(real - st.entry_price) / st.entry_price * 100
+                        st.entry_price = real
+                        st.stop_level = clamp_stop(real, st.atr_at_entry)
+                        st.peak_price = max(st.peak_price, real)
+                        st.provisional_entry = False
+                        log(f"ENTERED {sym} fill={real:.2f} "
+                            f"(signal px drifted {drift:.2f}%) "
+                            f"stop={st.stop_level:.2f}")
+                        # move the resting stop to match the real fill
+                        if P.use_broker_stop and st.stop_order_id:
+                            try:
+                                api.cancel_order(st.stop_order_id)
+                                st.stop_order_id = api.submit_stop_order(
+                                    sym, st.qty, st.stop_level)
+                                log(f"BSTOP  {sym} re-placed at {st.stop_level:.2f} "
+                                    f"id={st.stop_order_id}")
+                            except Exception as e:
+                                log(f"BSTOP-ERR {sym} re-place failed: {e}")
+                except Exception as e:
+                    log(f"FILL-WARN {sym}: {e} -- keeping provisional entry "
+                        f"{st.entry_price:.2f}, stop {st.stop_level:.2f}")
 
             # one evaluation per closed bar
             if st.last_bar_ts is not None:
@@ -844,6 +1134,23 @@ def main():
             if held_here:
                 st.armed = False
                 st.last_rose = None
+                st.bars_held += 1
+                if sig["price"] > st.peak_price:
+                    st.peak_price = sig["price"]
+
+                # ---- time stop: the position that is neither working nor
+                # losing enough to stop out. Only fires flat-or-down, so it
+                # can never take a winner off you.
+                if P.use_time_stop and st.bars_held > P.time_stop_bars:
+                    losing = sig["price"] <= st.entry_price
+                    if losing or not P.time_stop_only_if_losing:
+                        pnl = ((sig["price"] / st.entry_price - 1) * 100
+                               if st.entry_price else 0.0)
+                        log(f"TIME   {sym} {st.bars_held} bars held, "
+                            f"{pnl:+.2f}% -- no progress")
+                        pf.on_exit(sym, "time-stop")
+                        continue
+
                 if P.exit_mode == "slope_decay" and sig["sell_now"]:
                     log(f"SELL   {sym} sl6={sig.get('sl6', 0):.5f}")
                     pf.on_exit(sym, "slope-decay")
