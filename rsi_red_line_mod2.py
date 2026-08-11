@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 # =============================================================================
 #  RSI RED LINE  --  MOD 2
@@ -29,7 +30,7 @@
 #      set -a; source .env; set +a
 #      ~/algotrend1v5/venv/bin/python3 rsi_red_line_mod2.py
 # =============================================================================
-
+ 
 import os
 import sys
 import csv
@@ -39,26 +40,26 @@ import signal as _sig
 from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
+ 
 import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv
-
+ 
 load_dotenv()
-
+ 
 AZ = ZoneInfo("America/Phoenix")
 ET = ZoneInfo("America/New_York")
-
+ 
 TS_OAUTH_URL = "https://signin.tradestation.com/oauth/token"
 TS_BASE = {
     "sim":  "https://sim-api.tradestation.com/v3",
     "live": "https://api.tradestation.com/v3",
 }
-
+ 
 # ------------------------------------------------------------ constants ------
 # Straight from the spec. CEILING is intentionally absent and must stay absent.
-
+ 
 RSI_LEN        = 7
 RSI_ARM        = 35
 SIMUL_BARS     = 3         # all three conditions must occur within this many
@@ -73,7 +74,7 @@ WARMUP_BARS    = 30
 HARD_FLOOR     = -5.0      # percent; the ONLY mechanical exit
 DISPLAY_TARGET = 2.5       # DISPLAY ONLY -- must not touch control flow
 MAX_SLOTS      = 3
-
+ 
 # Groups. A 2-tuple is a long/inverse pair (mutually exclusive, one slot);
 # a 1-tuple is a lone symbol that just occupies a slot with no partner.
 # SNXX/SNDQ per spec (note SNDQ, not SNDR). OKLL/OKLS, SKUU/SKDD, AAOX added.
@@ -98,11 +99,11 @@ for _grp in PAIRS:
         PARTNER[_grp[0]] = _grp[1]
         PARTNER[_grp[1]] = _grp[0]
     # singletons have no partner; PARTNER.get(sym) will return None
-
+ 
 _dupes = [s for s in set(SYMBOLS) if SYMBOLS.count(s) > 1]
 if _dupes:
     raise SystemExit(f"FATAL: duplicate symbols in PAIRS: {sorted(_dupes)}")
-
+ 
 BAR_MINUTES = 1
 BAR_LOOKBACK = 400            # enough for warmup + a full session
 MARKET_OPEN_ET = "09:30"
@@ -111,26 +112,26 @@ NO_NEW_AFTER_ET = "15:58"     # need a next bar in the same session
 EOD_FLATTEN_ET = "15:59"
 POLL_SECONDS = int(os.getenv("POLL_SECONDS") or 20)
 LOG_CSV = os.getenv("MOD2_LOG") or "rsi_red_line_mod2_log.csv"
-
+ 
 LOG_COLUMNS = [
     "time", "ticker", "price", "floor_price", "display_target",
     "rsi", "angle_now", "angle_was", "slots_in_use", "names_open",
     "took", "fill", "sold_at", "sold_time", "reason",
 ]
-
-
+ 
+ 
 def log(msg):
     ts = datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S AZ")
     print(f"{ts} | {msg}", flush=True)
-
-
+ 
+ 
 # ------------------------------------------------------------ indicators -----
 # ema and rsi_wilder are identical to the proven versions in rsiAlgo.py.
-
+ 
 def ema(s: pd.Series, n: int) -> pd.Series:
     return s.ewm(span=n, adjust=False).mean()
-
-
+ 
+ 
 def rsi_wilder(close: pd.Series, n: int) -> pd.Series:
     d = close.diff()
     gain = d.clip(lower=0.0)
@@ -139,16 +140,16 @@ def rsi_wilder(close: pd.Series, n: int) -> pd.Series:
     al = loss.ewm(alpha=1 / n, adjust=False).mean()
     rs = ag / al.replace(0, np.nan)
     return (100 - 100 / (1 + rs)).fillna(100)
-
-
+ 
+ 
 def wma(s: pd.Series, n: int) -> pd.Series:
     w = np.arange(1, n + 1, dtype=float)
     return s.rolling(n).apply(lambda x: np.dot(x, w) / w.sum(), raw=True)
-
-
+ 
+ 
 def hma(s: pd.Series, n: int) -> pd.Series:
     """Hull MA: WMA(2*WMA(n/2) - WMA(n), sqrt(n)).
-
+ 
     The spec writes the HMA(7) as WMA(2*WMA(close,3) - WMA(close,7), 3):
     half = round(7/2) = 3 (wait: round(3.5)=4 in banker's rounding, but the
     spec pins half=3 and final=3 explicitly), so we use the spec's exact
@@ -156,11 +157,11 @@ def hma(s: pd.Series, n: int) -> pd.Series:
     half = 3
     root = 3
     return wma(2 * wma(s, half) - wma(s, n), root)
-
-
+ 
+ 
 def black_angle(black: pd.Series) -> pd.Series:
     """Angle of the black line in MATH degrees, per spec section 3.
-
+ 
     pct_per_bar = (black[i]/black[i-5] - 1) * 100 / 5
     angle       = degrees(arctan(pct_per_bar))
     Calibration: 1% per bar == 45 degrees. These are not protractor degrees.
@@ -168,10 +169,10 @@ def black_angle(black: pd.Series) -> pd.Series:
     prev = black.shift(ANGLE_LOOKBACK)
     pct_per_bar = (black / prev - 1.0) * 100.0 / ANGLE_LOOKBACK
     return np.degrees(np.arctan(pct_per_bar))
-
-
+ 
+ 
 # ------------------------------------------------------------ session --------
-
+ 
 def session_filter(df):
     """Keep only weekday bars inside 09:30-16:00 ET. Filters by time-of-day so
     prior sessions keep the indicators warm at the open."""
@@ -184,38 +185,38 @@ def session_filter(df):
         et = et.between_time(MARKET_OPEN_ET, MARKET_CLOSE_ET)
     et = et[et.index.weekday < 5]
     return et.tz_convert("UTC")
-
-
+ 
+ 
 def bar_et(ts):
     try:
         return pd.Timestamp(ts).tz_convert(ET).strftime("%H:%M")
     except Exception:
         return str(ts)
-
-
+ 
+ 
 def _to_utc_index(values):
     out = []
     for v in values:
         t = pd.Timestamp(v)
         out.append(t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC"))
     return pd.DatetimeIndex(out)
-
-
+ 
+ 
 # ------------------------------------------------------------ TS client ------
 # Trimmed to what mod2 needs: auth, bars, quote, account/balance, market buy,
 # market sell-to-flat. No ATR, no resting stop -- the spec forbids them.
-
+ 
 @dataclass
 class _Trade:
     price: float
-
-
+ 
+ 
 @dataclass
 class _Account:
     account_number: str
     status: str
-
-
+ 
+ 
 class TradeStationClient:
     def __init__(self):
         self.client_id = (os.getenv("TS_CLIENT_ID") or os.getenv("TS_API_KEY")
@@ -229,11 +230,11 @@ class TradeStationClient:
         self.env = (os.getenv("TS_ENV") or "sim").lower()
         self.dry_run = (os.getenv("DRY_RUN") or "1") != "0"
         self.drop_forming_bar = (os.getenv("DROP_FORMING_BAR") or "1") != "0"
-
+ 
         if self.env not in TS_BASE:
             raise SystemExit(f"TS_ENV must be 'sim' or 'live', got {self.env!r}")
         self.base = TS_BASE[self.env]
-
+ 
         missing = [k for k, v in {
             "TS_CLIENT_ID (or TS_API_KEY)": self.client_id,
             "TS_CLIENT_SECRET (or TS_SECRET)": self.client_secret,
@@ -242,11 +243,11 @@ class TradeStationClient:
         }.items() if not v]
         if missing:
             raise SystemExit(f"FATAL: missing TradeStation creds in .env: {missing}")
-
+ 
         self._token = None
         self._token_exp = 0.0
         self._session = requests.Session()
-
+ 
     def _access_token(self):
         if self._token and time.time() < self._token_exp - 60:
             return self._token
@@ -263,22 +264,22 @@ class TradeStationClient:
         self._token_exp = time.time() + int(tok.get("expires_in", 1200))
         log(f"Token valid for {int(tok.get('expires_in', 1200))}s")
         return self._token
-
+ 
     def _headers(self):
         return {"Authorization": f"Bearer {self._access_token()}"}
-
+ 
     def _get(self, path, params=None):
         r = self._session.get(self.base + path, headers=self._headers(),
                               params=params, timeout=20)
         r.raise_for_status()
         return r.json()
-
+ 
     def _post(self, path, body):
         r = self._session.post(self.base + path, headers=self._headers(),
                                json=body, timeout=20)
         r.raise_for_status()
         return r.json()
-
+ 
     def get_bars(self, symbol, limit=None):
         params = {"interval": BAR_MINUTES, "unit": "Minute",
                   "barsback": limit or BAR_LOOKBACK}
@@ -298,13 +299,13 @@ class TradeStationClient:
         if self.drop_forming_bar and len(df) > 1:
             df = df.iloc[:-1]
         return df
-
+ 
     def get_latest_trade(self, symbol):
         data = self._get(f"/marketdata/quotes/{symbol}")
         q = (data.get("Quotes") or [{}])[0]
         last = q.get("Last") or q.get("Close") or 0.0
         return _Trade(float(last))
-
+ 
     def get_account(self):
         data = self._get("/brokerage/accounts")
         accts = data.get("Accounts", [])
@@ -318,7 +319,7 @@ class TradeStationClient:
         me = me or {}
         return _Account(me.get("AccountID", self.account_id),
                         me.get("Status", "UNKNOWN"))
-
+ 
     def get_balance(self):
         try:
             data = self._get(f"/brokerage/accounts/{self.account_id}/balances")
@@ -329,7 +330,7 @@ class TradeStationClient:
         except Exception as e:
             log(f"WARN could not read balances: {e}")
             return None
-
+ 
     def list_positions(self):
         data = self._get(f"/brokerage/accounts/{self.account_id}/positions")
         out = {}
@@ -339,7 +340,7 @@ class TradeStationClient:
                 "avg": float(p.get("AveragePrice", 0) or 0),
             }
         return out
-
+ 
     def market_buy(self, symbol, qty):
         body = {"AccountID": self.account_id, "Symbol": symbol,
                 "Quantity": str(int(qty)), "OrderType": "Market",
@@ -349,7 +350,7 @@ class TradeStationClient:
             log(f"DRY-RUN buy suppressed: BUY {qty} {symbol}")
             return {"dry_run": True}
         return self._post("/orderexecution/orders", body)
-
+ 
     def market_sell(self, symbol, qty):
         body = {"AccountID": self.account_id, "Symbol": symbol,
                 "Quantity": str(int(qty)), "OrderType": "Market",
@@ -359,10 +360,10 @@ class TradeStationClient:
             log(f"DRY-RUN sell suppressed: SELL {qty} {symbol}")
             return {"dry_run": True}
         return self._post("/orderexecution/orders", body)
-
-
+ 
+ 
 # ------------------------------------------------------------ signal ---------
-
+ 
 @dataclass
 class Frame:
     """Everything the signal needs for the latest closed bar."""
@@ -378,21 +379,21 @@ class Frame:
     angle_now: float
     angle_was: float     # min angle over the prior STEEP_LOOKBACK bars
     bar_index: int       # position in the current session (0-based)
-
-
+ 
+ 
 def build_frame(df: pd.DataFrame) -> Frame:
     close = df["close"]
     black = ema(close, EMA_LEN)
     red = hma(close, HMA_LEN)
     rsi = rsi_wilder(close, RSI_LEN)
     angle = black_angle(black)
-
+ 
     # session index: how many bars since this session's 09:30 ET open
     et_idx = df.index.tz_convert(ET)
     today = et_idx[-1].date()
     session_mask = (et_idx.date == today)
     bar_index = int(session_mask.sum()) - 1
-
+ 
     was = angle.iloc[-(STEEP_LOOKBACK + 1):-1]   # prior 30 bars, excl current
     return Frame(
         ts=df.index[-1],
@@ -408,29 +409,29 @@ def build_frame(df: pd.DataFrame) -> Frame:
         angle_was=float(was.min()) if len(was) else float("nan"),
         bar_index=bar_index,
     )
-
-
+ 
+ 
 def arm_fires(fr: Frame) -> bool:
     """ARM event: RSI crosses up through 35. rsi[i-1] < 35 <= rsi[i]."""
     return fr.rsi_prev < RSI_ARM <= fr.rsi_now
-
-
+ 
+ 
 def black_gate_open(fr: Frame) -> bool:
     """Was steep in the last 30 bars, and has now shallowed above -15.
     No upper bound: flat and rising both qualify."""
     if math.isnan(fr.angle_was):
         return False
     return (fr.angle_was <= WAS_STEEP) and (fr.angle_now > SHALLOWED)
-
-
+ 
+ 
 def red_rising(fr: Frame) -> bool:
     """Red line rising TWO bars in a row (param #3, CHANGED from 1 bar).
     red[i] > red[i-1] > red[i-2]."""
     return fr.red_now > fr.red_prev > fr.red_prev2
-
-
+ 
+ 
 # ------------------------------------------------------------ state ----------
-
+ 
 @dataclass
 class Pos:
     symbol: str
@@ -439,8 +440,8 @@ class Pos:
     qty: int
     opened_ts: object
     armed_until: int = -1     # session bar index the arm expires on
-
-
+ 
+ 
 # per-symbol arm latch (independent of holding a position)
 @dataclass
 class Arm:
@@ -451,65 +452,65 @@ class Arm:
     last_rsi_cross: int = -1     # RSI crossed up through the level
     last_black: int = -1         # black gate open
     last_red: int = -1           # red rising 2 bars
-
-
+ 
+ 
 # ------------------------------------------------------------ CSV ------------
-
+ 
 def ensure_csv():
     if not os.path.exists(LOG_CSV):
         with open(LOG_CSV, "w", newline="") as f:
             csv.writer(f).writerow(LOG_COLUMNS)
-
-
+ 
+ 
 def append_alert(row: dict):
     with open(LOG_CSV, "a", newline="") as f:
         csv.writer(f).writerow([row.get(c, "") for c in LOG_COLUMNS])
-
-
+ 
+ 
 # ------------------------------------------------------------ clock ----------
-
+ 
 def et_now():
     return datetime.now(ET)
-
-
+ 
+ 
 def _hhmm(s):
     hh, mm = s.split(":")
     return int(hh), int(mm)
-
-
+ 
+ 
 def in_session(now_et):
     oh, om = _hhmm(MARKET_OPEN_ET)
     ch, cm = _hhmm(MARKET_CLOSE_ET)
     o = now_et.replace(hour=oh, minute=om, second=0, microsecond=0)
     c = now_et.replace(hour=ch, minute=cm, second=0, microsecond=0)
     return o <= now_et <= c and now_et.weekday() < 5
-
-
+ 
+ 
 def past(now_et, hhmm_str):
     hh, mm = _hhmm(hhmm_str)
     mark = now_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
     return now_et >= mark
-
-
+ 
+ 
 _RUNNING = True
-
-
+ 
+ 
 def _stop(*_):
     global _RUNNING
     _RUNNING = False
-
-
+ 
+ 
 # ------------------------------------------------------------ main -----------
-
+ 
 def main():
     _sig.signal(_sig.SIGINT, _stop)
     _sig.signal(_sig.SIGTERM, _stop)
-
+ 
     api = TradeStationClient()
     api._access_token()
     acct = api.get_account()
     ensure_csv()
-
+ 
     _u = datetime.now(ZoneInfo("UTC"))
     log("CLOCK  utc=%s | et=%s | az=%s"
         % (_u.strftime("%H:%M:%S"),
@@ -537,27 +538,27 @@ def main():
     if api.env == "live" and not api.dry_run:
         log("*** LIVE TRADING ENABLED -- real orders will be sent ***")
     log("=" * 64)
-
+ 
     positions = {}          # symbol -> Pos
     arms = {s: Arm() for s in SYMBOLS}
-
+ 
     def slots_in_use():
         return len(positions)
-
+ 
     def names_open():
         return "|".join(sorted(positions.keys()))
-
+ 
     def pair_leg_open(sym):
         partner = PARTNER.get(sym)
         return partner in positions
-
+ 
     while _RUNNING:
         now = et_now()
         if not in_session(now):
             log("Session closed. Sleeping.")
             time.sleep(30)
             continue
-
+ 
         # ---- EOD: flatten everything, per spec (session end closes) --------
         if past(now, EOD_FLATTEN_ET):
             for sym, pos in list(positions.items()):
@@ -569,10 +570,32 @@ def main():
                 positions.pop(sym, None)
             log("EOD reached. Flat. Exiting loop.")
             break
-
+ 
+        # ---- reconcile with the broker: did Gary sell by hand? -------------
+        # The engine cannot see Gary's manual sells directly. Each cycle we ask
+        # the broker what actually exists. If we think we hold a name but the
+        # broker shows it flat, Gary sold it -> drop it, free the slot, and
+        # reset its arm state so a FRESH 3-condition cluster is required before
+        # re-entering (no instant re-fire on stale conditions).
+        # Skipped in dry_run: the broker has no simulated positions, so syncing
+        # would wrongly wipe everything (the same trap rsiAlgo.py hit).
+        if not api.dry_run and positions:
+            try:
+                live_pos = api.list_positions()
+                for sym in list(positions.keys()):
+                    held_qty = live_pos.get(sym, {}).get("qty", 0)
+                    if held_qty <= 0:
+                        positions.pop(sym, None)
+                        arms[sym] = Arm()      # reset -> needs a fresh signal
+                        log(f"GARY-SOLD {sym} -- broker flat, engine was holding. "
+                            f"Slot freed, {sym} eligible to re-enter today.")
+            except Exception as e:
+                log(f"SYNC-WARN could not list positions: {e} "
+                    f"(keeping engine state as-is this cycle)")
+ 
         allow_new = not past(now, NO_NEW_AFTER_ET)
         board = []          # one row per symbol, printed at end of cycle
-
+ 
         for sym in SYMBOLS:
             try:
                 df = api.get_bars(sym)
@@ -585,9 +608,9 @@ def main():
             if df is None or len(df) < WARMUP_BARS + ANGLE_LOOKBACK + 2:
                 board.append((sym, "warmup", ""))
                 continue
-
+ 
             fr = build_frame(df)
-
+ 
             # -------- manage an OPEN position: hard floor only --------------
             if sym in positions:
                 pos = positions[sym]
@@ -608,7 +631,7 @@ def main():
                 # Layer-1 suppression: no re-alert while open, and Gary sells
                 # by hand, so nothing else to do for a held name.
                 continue
-
+ 
             # -------- 3-bar simultaneity clock (params #5/#6) ---------------
             # Evaluate all three conditions on THIS bar and record when each was
             # last true. Fire only when all three have occurred within a window
@@ -626,7 +649,7 @@ def main():
                 a.last_black = i
             if c_red:
                 a.last_red = i
-
+ 
             # ---- how close is this ticker to firing? (for the board) -------
             # A condition counts as "live" if it fired within the last
             # SIMUL_BARS bars. Show R/B/^ for rsi-cross / black-gate / red-rise.
@@ -650,7 +673,7 @@ def main():
             detail = ("%s  rsi=%.1f ang=%.1f was=%.1f red=%.3f"
                       % (flags, fr.rsi_now, fr.angle_now, fr.angle_was, fr.red_now))
             board.append((sym, state, detail))
-
+ 
             seen = (a.last_rsi_cross, a.last_black, a.last_red)
             if -1 in seen:
                 continue                       # not all three have happened yet
@@ -658,7 +681,7 @@ def main():
                 continue                       # they did not cluster in 3 bars
             if max(seen) != i:
                 continue                       # only fire on the completing bar
-
+ 
             # all three conditions satisfied within a 3-bar window -> FIRE
             if fr.bar_index < WARMUP_BARS:
                 continue                       # earliest alert is bar 30
@@ -671,11 +694,11 @@ def main():
             if pair_leg_open(sym):
                 log(f"PAIR-SKIP {sym} (partner {PARTNER[sym]} already open)")
                 continue
-
+ 
             # ---- capture slots/names AT THE MOMENT OF FIRE (spec 8) --------
             slots_at_fire = slots_in_use()
             names_at_fire = names_open()
-
+ 
             # ---- AUTO enter: market buy 1 share ----------------------------
             fill = fr.close                    # provisional; refined below
             try:
@@ -688,17 +711,17 @@ def main():
             except Exception as e:
                 log(f"BUY-ERR {sym}: {e} -- not entering")
                 continue
-
+ 
             floor = fill * (1 + HARD_FLOOR / 100.0)
             positions[sym] = Pos(symbol=sym, entry=fill, floor=floor, qty=1,
                                  opened_ts=fr.ts)
-
+ 
             log(f"FIRE   {sym} [{bar_et(fr.ts)}] bar {fr.bar_index} "
                 f"in @ {fill:.4f} floor {floor:.4f} "
                 f"rsi={fr.rsi_now:.1f} angle_now={fr.angle_now:.1f} "
                 f"angle_was={fr.angle_was:.1f} slots={slots_at_fire} "
                 f"target(disp)={DISPLAY_TARGET}%")
-
+ 
             append_alert({
                 "time": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
                 "ticker": sym,
@@ -714,7 +737,7 @@ def main():
                 "took": "", "fill": "", "sold_at": "",
                 "sold_time": "", "reason": "",
             })
-
+ 
         # ---- status board: who is armed / close to firing -----------------
         # Order by how close each ticker is: ARMED* first, then ready, watch...
         rank = {"ARMED*": 0, "ready": 1, "watch": 2, "HELD": 3, "flat": 4,
@@ -730,14 +753,15 @@ def main():
         log("  slots %d/%d   armed=%d ready=%d   held=%s"
             % (slots_in_use(), MAX_SLOTS, n_armed, n_ready,
                names_open() or "none"))
-
+ 
         time.sleep(POLL_SECONDS)
-
+ 
     log("Shutdown. Open positions (if any) left for manual handling:")
     for sym, pos in positions.items():
         log(f"  HELD {sym} entry={pos.entry:.2f} floor={pos.floor:.2f}")
-
-
+ 
+ 
 if __name__ == "__main__":
     WARMUP_BARS = WARMUP_BARS  # keep name in scope for clarity
     main()
+ 
