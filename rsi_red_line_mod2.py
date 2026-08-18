@@ -12,10 +12,16 @@
 #      gate, red-line (HMA7) rising. All three true on the same bar -> FIRE.
 #    - Entry:  AUTO. Market buy on fire; recorded fill is the entry price.
 #              (Spec's reference entry is next bar's open; live fills at market.)
-#    - Size:   1 share. Learning run.
+#    - Size:   ~$1000 notional per entry. Share count = floor(TRADE_NOTIONAL /
+#              price at fire), minimum 1 share. Updated 2026-08-18 (was fixed
+#              1 share -- "learning run" sizing).
 #    - Exit:   ONLY mechanical exit is the hard floor at entry x 0.95.
 #              Selling is MANUAL (Gary, by hand). EOD flat.
-#    - Suppression: per-ticker while open, global slot cap (3), same-pair lock.
+#    - Suppression: per-ticker while open, global slot cap (10), same-pair lock.
+#              Slot cap raised 2026-08-18 from 3 -> 10 (Gary's choice). Note:
+#              the broker-sync below already detects Gary's manual sells and
+#              frees the slot mid-day -- that logic did not change, only the
+#              cap did.
 #
 #  Deliberately ABSENT (spec sections 9 & 10 forbid these):
 #    - No volatility-based stop or gate of any kind.
@@ -73,7 +79,12 @@ SHALLOWED      = -15.0     # degrees
 WARMUP_BARS    = 30
 HARD_FLOOR     = -5.0      # percent; the ONLY mechanical exit
 DISPLAY_TARGET = 2.5       # DISPLAY ONLY -- must not touch control flow
-MAX_SLOTS      = 3
+MAX_SLOTS      = 10        # raised 2026-08-18 from 3 -> 10 (Gary's choice)
+ 
+# Position sizing: dollar notional per entry rather than a fixed share count.
+# qty = floor(TRADE_NOTIONAL / price-at-fire), minimum 1 share. Overridable
+# via env for testing without touching this file.
+TRADE_NOTIONAL = float(os.getenv("TRADE_NOTIONAL") or 1000.0)
  
 # Groups. A 2-tuple is a long/inverse pair (mutually exclusive, one slot);
 # a 1-tuple is a lone symbol that just occupies a slot with no partner.
@@ -530,7 +541,8 @@ def main():
         f" | black: was<= {WAS_STEEP:.0f} in {STEEP_LOOKBACK}b then now> {SHALLOWED:.0f}"
         f" | red(HMA{HMA_LEN}) rising 2 bars"
         f" | all 3 within {SIMUL_BARS} bars")
-    log(f"EXEC    entry=AUTO market buy, 1 share | floor={HARD_FLOOR:.0f}% "
+    log(f"EXEC    entry=AUTO market buy, ~${TRADE_NOTIONAL:,.0f} notional "
+        f"(dynamic share count) | floor={HARD_FLOOR:.0f}% "
         f"(ONLY mechanical exit) | sell=MANUAL | EOD flat {EOD_FLATTEN_ET} ET")
     log(f"SUPPRESS per-ticker + global slots<= {MAX_SLOTS} + same-pair lock")
     log(f"UNIVERSE {', '.join(SYMBOLS)}")
@@ -626,8 +638,8 @@ def main():
                 else:
                     pnl = (fr.close / pos.entry - 1) * 100 if pos.entry else 0.0
                     board.append((sym, "HELD",
-                                  "in @ %.2f  %+.1f%%  floor %.2f  (Gary sells)"
-                                  % (pos.entry, pnl, pos.floor)))
+                                  "in @ %.2f x%d  %+.1f%%  floor %.2f  (Gary sells)"
+                                  % (pos.entry, pos.qty, pnl, pos.floor)))
                 # Layer-1 suppression: no re-alert while open, and Gary sells
                 # by hand, so nothing else to do for a held name.
                 continue
@@ -699,25 +711,37 @@ def main():
             slots_at_fire = slots_in_use()
             names_at_fire = names_open()
  
-            # ---- AUTO enter: market buy 1 share ----------------------------
+            # ---- size the order: ~$1000 notional at the current price ------
+            # fr.close is the last closed bar's price -- close enough to a
+            # market fill to size the order; the ACTUAL fill price (and
+            # therefore actual notional) is refined just below once the
+            # broker reports the average fill.
+            if fr.close <= 0:
+                log(f"BUY-ERR {sym}: non-positive price {fr.close}, not entering")
+                continue
+            qty = max(1, int(TRADE_NOTIONAL // fr.close))
+ 
+            # ---- AUTO enter: market buy ~$1000 notional ---------------------
             fill = fr.close                    # provisional; refined below
             try:
-                api.market_buy(sym, 1)
+                api.market_buy(sym, qty)
                 if not api.dry_run:
                     time.sleep(1.5)
                     live = api.list_positions()
                     if sym in live and live[sym]["avg"] > 0:
                         fill = live[sym]["avg"]
+                        if live[sym]["qty"] > 0:
+                            qty = live[sym]["qty"]   # true filled quantity
             except Exception as e:
                 log(f"BUY-ERR {sym}: {e} -- not entering")
                 continue
  
             floor = fill * (1 + HARD_FLOOR / 100.0)
-            positions[sym] = Pos(symbol=sym, entry=fill, floor=floor, qty=1,
+            positions[sym] = Pos(symbol=sym, entry=fill, floor=floor, qty=qty,
                                  opened_ts=fr.ts)
  
             log(f"FIRE   {sym} [{bar_et(fr.ts)}] bar {fr.bar_index} "
-                f"in @ {fill:.4f} floor {floor:.4f} "
+                f"in @ {fill:.4f} x{qty} (~${fill * qty:,.0f}) floor {floor:.4f} "
                 f"rsi={fr.rsi_now:.1f} angle_now={fr.angle_now:.1f} "
                 f"angle_was={fr.angle_was:.1f} slots={slots_at_fire} "
                 f"target(disp)={DISPLAY_TARGET}%")
@@ -758,10 +782,9 @@ def main():
  
     log("Shutdown. Open positions (if any) left for manual handling:")
     for sym, pos in positions.items():
-        log(f"  HELD {sym} entry={pos.entry:.2f} floor={pos.floor:.2f}")
+        log(f"  HELD {sym} entry={pos.entry:.2f} qty={pos.qty} floor={pos.floor:.2f}")
  
  
 if __name__ == "__main__":
     WARMUP_BARS = WARMUP_BARS  # keep name in scope for clarity
     main()
- 
