@@ -58,14 +58,11 @@ import rsi_red_line_mod2 as base
 # ---- Validated parameter change from the 2026-08-19 testing session ----
 base.WAS_STEEP = -30.0  # was -20.0
  
-import tkinter as tk
-from tkinter import font as tkfont
- 
 import io
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from PIL import Image, ImageTk
+from PIL import Image
  
 POPUP_TIMEOUT_SECONDS = 600  # auto-dismiss an unapproved popup after 10 minutes
                               # (if you haven't clicked by then, the setup has
@@ -173,108 +170,78 @@ decision_queue = queue.Queue()   # UI thread -> order-placing thread: what you c
 open_positions = {}              # symbol -> {"entry": float, "peak": float, "qty": int}
  
  
-class ApprovalWindow:
-    """Manages the on-screen popup(s). Runs on the main (UI) thread."""
+class TerminalApproval:
+    """
+    Plain-text replacement for the old on-screen popup window.
  
-    def __init__(self, root):
-        self.root = root
-        self.active = {}  # symbol -> Toplevel window currently showing
+    Why this exists: the popup version used tkinter to draw an actual
+    window with buttons on your screen. That only works if there's a
+    real display attached. This script runs headless, over SSH/tmux, on
+    a remote server with no screen -- so instead, this just prints the
+    same information as plain text right here in the terminal, and
+    waits for you to type Y (or just press Enter to skip/hold).
  
-    def show_signal(self, symbol, price, ts, chart_img, kind="BUY", reason=None):
-        popup_key = f"{kind}:{symbol}"
-        if popup_key in self.active:
-            return  # already showing one for this symbol/kind -- don't stack duplicates
-        win = tk.Toplevel(self.root)
-        win.title(f"RSI Mod2 -- {kind} Signal")
-        win.attributes("-topmost", True)
-        win.geometry("+80+80")
-        win.configure(bg="#1e1e1e")
+    Everything downstream (decision_worker, order placing, logging) is
+    UNCHANGED -- this only replaces how the question gets asked.
+    """
  
-        big = tkfont.Font(size=18, weight="bold")
-        small = tkfont.Font(size=11)
+    @staticmethod
+    def _read_line_with_timeout(prompt, timeout_sec):
+        """Prints prompt, waits up to timeout_sec seconds for you to type
+        a line and press Enter. Returns what you typed, or None if time
+        ran out with no answer."""
+        result_q = queue.Queue()
  
-        header = f"{symbol}" if kind == "BUY" else f"SELL {symbol}"
-        tk.Label(win, text=header, font=big, fg="white", bg="#1e1e1e",
-                 padx=24, pady=(14, 0)).pack()
-        if kind == "BUY":
-            tk.Label(win, text=f"signal price ~${price:.2f}", font=small, fg="#bbbbbb", bg="#1e1e1e",
-                     padx=24, pady=(0, 2)).pack()
-            tk.Label(win, text="(market order -- fills at current price when approved)",
-                     font=tkfont.Font(size=9), fg="#888888", bg="#1e1e1e",
-                     padx=24, pady=(0, 8)).pack()
-        else:
-            tk.Label(win, text=f"current price ~${price:.2f}  --  {reason}", font=small, fg="#bbbbbb", bg="#1e1e1e",
-                     padx=24, pady=(0, 2)).pack()
-            tk.Label(win, text="(market order -- fills at current price when approved)",
-                     font=tkfont.Font(size=9), fg="#888888", bg="#1e1e1e",
-                     padx=24, pady=(0, 8)).pack()
- 
-        # the chart -- this is what lets you actually eyeball the setup
-        if chart_img is not None:
-            photo = ImageTk.PhotoImage(chart_img)
-            chart_label = tk.Label(win, image=photo, bg="#1e1e1e")
-            chart_label.image = photo  # keep a reference so it isn't garbage-collected
-            chart_label.pack(padx=12, pady=(0, 8))
-        else:
-            tk.Label(win, text="(chart unavailable)", fg="#888888", bg="#1e1e1e",
-                     padx=24, pady=8).pack()
- 
-        def approve():
-            decision_queue.put(("APPROVE_" + kind, symbol, price, ts))
-            _close()
- 
-        def skip():
-            decision_queue.put(("SKIP_" + kind, symbol, price, ts))
-            _close()
- 
-        def _close():
+        def _reader():
             try:
-                win.destroy()
-            except tk.TclError:
-                pass
-            self.active.pop(popup_key, None)
+                line = input(prompt)
+            except EOFError:
+                return  # stdin closed with nothing typed -- let it time out naturally
+            result_q.put(line)
  
-        btn_frame = tk.Frame(win, bg="#1e1e1e", pady=14)
-        btn_frame.pack()
- 
-        btn_color = "#2ca02c" if kind == "BUY" else "#d62728"
-        btn_text = "APPROVE BUY" if kind == "BUY" else "APPROVE SELL"
-        approve_btn = tk.Button(
-            btn_frame, text=btn_text, bg=btn_color, fg="white",
-            activebackground=btn_color, font=tkfont.Font(size=15, weight="bold"),
-            width=16, height=2, relief="flat", command=approve,
-        )
-        approve_btn.pack(side="left", padx=12)
- 
-        skip_btn = tk.Button(
-            btn_frame, text="Skip", command=skip, width=8, relief="flat",
-        )
-        skip_btn.pack(side="left", padx=12)
- 
-        win.bind("<Return>", lambda e: approve())
-        win.bind("<Escape>", lambda e: skip())
-        approve_btn.focus_set()
- 
-        self.active[popup_key] = win
-        win.after(POPUP_TIMEOUT_SECONDS * 1000, lambda: self._expire(popup_key, win, kind, symbol))
- 
-    def _expire(self, popup_key, win, kind, symbol):
-        if popup_key in self.active and self.active[popup_key] is win:
-            try:
-                win.destroy()
-            except tk.TclError:
-                pass
-            self.active.pop(popup_key, None)
-            decision_queue.put(("EXPIRED_" + kind, symbol, None, None))
- 
-    def poll(self):
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
         try:
-            while True:
-                symbol, price, ts, chart_img, kind, reason = approval_queue.get_nowait()
-                self.show_signal(symbol, price, ts, chart_img, kind, reason)
+            return result_q.get(timeout=timeout_sec)
         except queue.Empty:
-            pass
-        self.root.after(300, self.poll)
+            return None
+ 
+    def run_forever(self):
+        """Runs in its own thread for the life of the program. Takes each
+        signal off approval_queue one at a time, asks a plain yes/no
+        question in the terminal, and forwards your answer to
+        decision_queue -- same queue, same message format the old popup
+        used, so decision_worker doesn't need to know anything changed."""
+        while base._RUNNING:
+            try:
+                symbol, price, ts, chart_img, kind, reason = approval_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+ 
+            if kind == "BUY":
+                header = f"BUY SIGNAL -- {symbol} @ ~${price:.2f}"
+                ask = "Type Y and press Enter to BUY, or just press Enter to skip."
+            else:
+                header = f"SELL SIGNAL -- {symbol} @ ~${price:.2f}  ({reason})"
+                ask = "Type Y and press Enter to SELL, or just press Enter to keep holding."
+ 
+            banner = (
+                f"\n{'='*60}\n{header}\n{'='*60}\n{ask}\n"
+                f"(you have {POPUP_TIMEOUT_SECONDS} seconds -- after that it auto-"
+                f"{'skips' if kind=='BUY' else 'expires (stays held)'})\n> "
+            )
+ 
+            answer = self._read_line_with_timeout(banner, POPUP_TIMEOUT_SECONDS)
+ 
+            if answer is None:
+                decision_queue.put((f"EXPIRED_{kind}", symbol, price, ts))
+                print(f"(no answer in time -- {symbol} {kind} EXPIRED)")
+                continue
+ 
+            if answer.strip().lower() in ("y", "yes"):
+                decision_queue.put((f"APPROVE_{kind}", symbol, price, ts))
+            else:
+                decision_queue.put((f"SKIP_{kind}", symbol, price, ts))
  
  
 def open_trend_worker(api):
@@ -547,18 +514,19 @@ def main():
         base.log("DRY_RUN is ON -- approvals will be logged but NOT sent as real orders. "
                   "Set DRY_RUN=0 in .env once you're ready to trade live with this.")
  
-    root = tk.Tk()
-    root.withdraw()  # hide the empty main window -- only the popups matter
-    ui = ApprovalWindow(root)
-    ui.poll()
+    ui = TerminalApproval()
  
+    threading.Thread(target=ui.run_forever, daemon=True).start()
     threading.Thread(target=signal_worker, args=(api,), daemon=True).start()
     threading.Thread(target=open_trend_worker, args=(api,), daemon=True).start()
     threading.Thread(target=sell_monitor_worker, args=(api,), daemon=True).start()
     threading.Thread(target=decision_worker, args=(api,), daemon=True).start()
  
-    root.mainloop()
+    # keep the main thread alive -- no GUI event loop needed anymore
+    while base._RUNNING:
+        time.sleep(1)
  
  
 if __name__ == "__main__":
     main()
+ 
