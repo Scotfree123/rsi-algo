@@ -36,6 +36,17 @@ SAFETY PROTECTIONS (ported over from the plain system, 2026-08-26 --
     - Same-pair lock: won't buy NBIL if NBIZ is already open (and
       vice versa for every inverse pair), same as the plain system.
 
+BUG FIX (2026-08-26 evening, THIS VERSION):
+    Found by backtesting Aug 24/25 against real signals: the "black line
+    was steep" check could reach back across a DIFFERENT trading day (even
+    a week+ earlier) and combine with today's real RSI/red-line conditions,
+    firing a false signal. Confirmed on SOXL, IRE, NBIZ, RKLX(8/25), CWVX,
+    and AAOX. Fixed two places (search "FIX (2026-08-26)" in this file):
+    every symbol's memory of these conditions is now wiped clean at the
+    start of each new trading day, and the steep-angle lookback can no
+    longer reach past today's own opening bar. This is the version to run
+    starting 2026-08-27.
+
 LOGGING: writes a complete round-trip row (entry + exit + reason) to
     its own CSV log the moment each trade actually closes -- a
     separate file from the plain system's log, so the two never
@@ -413,7 +424,17 @@ def build_frame(df: pd.DataFrame) -> Frame:
     session_mask = (et_idx.date == today)
     bar_index = int(session_mask.sum()) - 1
 
-    was = angle.iloc[-(STEEP_LOOKBACK + 1):-1]
+    # FIX (2026-08-26): the "was steep" lookback must never cross into a
+    # previous trading day. Cap the start of the window at today's first
+    # bar, even if STEEP_LOOKBACK(30) would otherwise reach further back
+    # into yesterday's data. Without this, a steep decline from a
+    # completely different day (sometimes a week+ earlier) could satisfy
+    # this check and combine with today's real RSI/red-line conditions,
+    # producing a false signal -- this is exactly the bug found and
+    # confirmed on SOXL, IRE, NBIZ, RKLX(8/25), CWVX, and AAOX.
+    today_start_pos = len(angle) - (bar_index + 1)
+    lookback_start = max(today_start_pos, len(angle) - (STEEP_LOOKBACK + 1))
+    was = angle.iloc[lookback_start:-1]
     return Frame(
         ts=df.index[-1],
         close=float(close.iloc[-1]),
@@ -487,6 +508,7 @@ def _stop(*_):
 approval_queue = queue.Queue()
 decision_queue = queue.Queue()
 open_positions = {}   # symbol -> dict with entry/peak/qty/opened_ts/entry indicator snapshot
+latest_frame = {}     # symbol -> most recent Frame, for the live status board
 
 
 class TerminalApproval:
@@ -555,12 +577,18 @@ def pair_leg_open(sym):
 
 def signal_worker(api):
     """Watches every symbol, auto-buys the instant the 3-part signal fires --
-    now WITH the slot cap and same-pair lock the plain system has."""
+    now WITH the slot cap and same-pair lock the plain system has, AND with
+    each symbol's arm state reset at the start of every new trading day so
+    a condition from a previous day can never combine with today's (fixed
+    2026-08-26 -- this was letting stale "black line was steep" flags from
+    days ago slip through and fire false signals)."""
     arms = {s: Arm() for s in SYMBOLS}
     last_signaled_bar = {s: None for s in SYMBOLS}
+    last_seen_date = {s: None for s in SYMBOLS}
 
     log(f"Signal worker started. WAS_STEEP={WAS_STEEP:.1f} (validated tighter "
-        f"threshold, was -20.0). MAX_SLOTS={MAX_SLOTS}, pair-lock ON.")
+        f"threshold, was -20.0). MAX_SLOTS={MAX_SLOTS}, pair-lock ON. "
+        f"Arm state resets daily per symbol (fixed 2026-08-26).")
 
     while _RUNNING:
         now_et = et_now()
@@ -577,12 +605,22 @@ def signal_worker(api):
                 if df is None or len(df) < WARMUP_BARS + STEEP_LOOKBACK + 5:
                     continue
                 fr = build_frame(df)
+                latest_frame[sym] = fr   # cache for the live status board
             except Exception as e:
                 log(f"WARN {sym}: {e}")
                 continue
 
             if fr.bar_index < WARMUP_BARS:
                 continue
+
+            # FIX (2026-08-26): brand-new day for this symbol -> wipe its
+            # arm memory so nothing from yesterday (or any earlier day) can
+            # ever combine with today's conditions.
+            today_date = fr.ts.date() if hasattr(fr.ts, "date") else now_et.date()
+            if last_seen_date[sym] != today_date:
+                arms[sym] = Arm()
+                last_signaled_bar[sym] = None
+                last_seen_date[sym] = today_date
 
             a = arms[sym]
             if arm_fires(fr):
@@ -630,6 +668,45 @@ def signal_worker(api):
                 log(f"ERROR auto-buying {sym}: {e}")
 
         time.sleep(POLL_SECONDS)
+
+
+STATUS_BOARD_SECONDS = 60   # how often the live status board prints
+
+
+def status_board_worker():
+    """Prints a one-line status board every minute showing what every
+    ticker is currently doing (RSI, black-line angle, red-line direction) --
+    same idea as the plain system's live board, added 2026-08-27 per Gary's
+    request so you can watch RSI creep toward 35 and the angle move toward
+    the thresholds, even on minutes where nothing fires."""
+    while _RUNNING:
+        time.sleep(STATUS_BOARD_SECONDS)
+        now_et = et_now()
+        if not in_session(now_et):
+            continue
+        if not latest_frame:
+            continue
+
+        lines = []
+        for sym in SYMBOLS:
+            fr = latest_frame.get(sym)
+            if fr is None:
+                if sym in open_positions:
+                    lines.append(f"{sym}:HOLDING")
+                else:
+                    lines.append(f"{sym}:no data yet")
+                continue
+            red_dir = "up" if fr.red_now > fr.red_prev else "down"
+            held = " [HOLDING]" if sym in open_positions else ""
+            lines.append(
+                f"{sym}:RSI={fr.rsi_now:4.1f} angle={fr.angle_now:+5.1f}deg "
+                f"was={fr.angle_was:+5.1f}deg red={red_dir}{held}"
+            )
+
+        log("--- status board ---")
+        # print 3 tickers per line so it stays readable in a normal terminal width
+        for i in range(0, len(lines), 3):
+            print("   " + "   |   ".join(lines[i:i + 3]), flush=True)
 
 
 def sell_monitor_worker(api):
@@ -754,6 +831,7 @@ def main():
     threading.Thread(target=signal_worker, args=(api,), daemon=True).start()
     threading.Thread(target=sell_monitor_worker, args=(api,), daemon=True).start()
     threading.Thread(target=decision_worker, args=(api,), daemon=True).start()
+    threading.Thread(target=status_board_worker, daemon=True).start()
 
     HEARTBEAT_SECONDS = 600
     last_heartbeat = time.time()
