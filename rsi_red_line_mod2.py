@@ -1,42 +1,45 @@
+
 #!/usr/bin/env python3
 """
 ============================================================
-  ENGINE B -- DOUBLE CYBORG  (built 2026-08-30)
+  ENGINE B -- DOUBLE CYBORG  (built 2026-08-30, updated 2026-08-31)
   Neither buy NOR sell happens automatically. Every signal
   asks for your approval right here in this terminal (type
   Y and press Enter to act, or just press Enter to skip/hold).
 ============================================================
- 
-This is Engine A's exact same, fully-tested signal logic (the
-2026-08-26 day-crossing bug fix, the 10-slot cap, the same-pair lock,
-and the family-lock for correlated tickers) -- the ONLY difference
-is that a real signal now asks for your approval before buying,
-instead of buying automatically. Nothing else changed.
- 
-WHY DOUBLE CYBORG: discussed 2026-08-30 -- since every candidate gets
-    a human look before any money moves, a false-positive signal here
-    only costs you a glance and a "no", not a real trade. That's a
-    different risk profile from Engine A (which buys the instant it
-    fires, with no human check first) -- so it's fine for Engine B to
-    be more permissive later if you decide the current rule is too
-    strict for a suggest-and-approve design. For now, this file uses
-    the SAME validated rule as Engine A (both parts of the black-line
-    check) as a safe, already-proven starting point.
  
 ONE SELF-CONTAINED FILE. This does NOT import any other script --
 everything it needs (TradeStation connection, indicators, signal
 detection, the ticker list) lives right here, so there is nothing
 else to keep in sync and nothing else that needs to be "connected."
  
-SIGNAL (same 3-part rule as Engine A):
-    RSI(7) crosses up through 35, black line (EMA20) was steep and
-    has now shallowed, red line (HMA7) rising 2 bars in a row --
-    all three within SIMUL_BARS(3) bars of each other.
-    WAS_STEEP is -30.0 here (tightened from the plain system's -20.0,
-    validated in the 2026-08-19 testing session: kept all 9 known-good
-    trades, blocked 14 of 34 known-bad trades, at zero cost).
+SIGNAL (2-part rule, RSI removed 2026-08-31 -- Gary's decision):
+    Black line (EMA20)'s CURRENT angle is shallower than SHALLOWED(-15
+    degrees) -- not in a strong downtrend right now, no requirement it
+    was ever steep beforehand -- AND red line (HMA7) rising 2 bars in a
+    row, both checked on the SAME bar. RSI used to be a third, required
+    condition here; extensive testing found essentially zero relationship
+    (correlation 0.064) between how "oversold" RSI got before a cross and
+    how well the trade performed afterward -- the theory behind requiring
+    it didn't hold up. Confirmed by construction: this simpler rule can
+    never fire LATER than the old 3-part rule would have on the same day,
+    only ever at the same time or earlier -- and testing found 71 real,
+    good trades the old rule missed entirely because RSI simply never
+    crossed 35 that day. One honest caveat found during testing: once
+    measured with a REALISTIC exit (not "held the whole day"), the two
+    versions perform similarly -- the real benefit here is genuinely more
+    candidates of comparable quality, not dramatically better ones, which
+    is exactly what matters for a Cyborg design where you review every
+    candidate yourself before any money moves.
  
-ENTRY: automatic market buy the instant the signal fires. Size is a
+WHY DOUBLE CYBORG: since every candidate gets a human look before any
+    money moves, a false-positive signal here only costs you a glance
+    and a "no", not a real trade. That's a different risk profile from
+    Engine A (which buys the instant it fires, with no human check
+    first) -- more candidates of comparable quality is a genuine
+    advantage here in a way it wouldn't be for Engine A.
+ 
+ENTRY: asks for your approval the instant the signal fires. Size is a
     FIXED 1 SHARE per trade (Gary's choice, 2026-08-26) -- simple,
     minimal exposure while this new combined version is being trusted.
  
@@ -106,9 +109,6 @@ TS_BASE = {
  
 # ------------------------------------------------------------ constants ------
  
-RSI_LEN        = 7
-RSI_ARM        = 35
-SIMUL_BARS     = 3
 EMA_LEN        = 20        # black
 HMA_LEN        = 7         # red
 ANGLE_LOOKBACK = 5
@@ -168,7 +168,7 @@ LOG_CSV = os.getenv("MOD2_CYBORG_LOG") or "rsi_mod2_B_approvebuy_log.csv"
 LOG_COLUMNS = [
     "time_opened", "time_closed", "ticker", "entry", "exit_price",
     "qty", "pnl_pct", "reason",
-    "rsi_at_entry", "angle_now_at_entry", "angle_was_at_entry",
+    "angle_now_at_entry", "angle_was_at_entry",
 ]
  
  
@@ -438,8 +438,6 @@ class Frame:
     close: float
     open_: float
     low: float
-    rsi_now: float
-    rsi_prev: float
     red_now: float
     red_prev: float
     red_prev2: float
@@ -452,7 +450,6 @@ def build_frame(df: pd.DataFrame) -> Frame:
     close = df["close"]
     black = ema(close, EMA_LEN)
     red = hma(close, HMA_LEN)
-    rsi = rsi_wilder(close, RSI_LEN)
     angle = black_angle(black)
  
     et_idx = df.index.tz_convert(ET)
@@ -460,19 +457,20 @@ def build_frame(df: pd.DataFrame) -> Frame:
     session_mask = (et_idx.date == today)
     bar_index = int(session_mask.sum()) - 1
  
-    # NOTE (2026-08-30): the old "was steep in the last 30 min" lookback
-    # (and the day-boundary fix that went with it) is gone -- Gary's
-    # decision was to drop that requirement entirely and check ONLY the
-    # black line's current angle. angle_was is kept as a field for
-    # logging/status-board purposes but is no longer used in the entry
-    # decision itself.
+    # NOTE (2026-08-31, Gary's decision): RSI dropped from the signal
+    # entirely. Extensive testing found essentially zero relationship
+    # (correlation 0.064) between how "oversold" RSI got before a cross
+    # and how well the trade performed afterward -- the theory behind
+    # requiring it didn't hold up. The real, meaningful signal has always
+    # come from the black line and red line; RSI was mostly adding delay,
+    # not protection. Confirmed by construction: this simpler 2-part rule
+    # can never fire LATER than the old 3-part rule would have on the
+    # same day -- only ever at the same time or earlier.
     return Frame(
         ts=df.index[-1],
         close=float(close.iloc[-1]),
         open_=float(df["open"].iloc[-1]),
         low=float(df["low"].iloc[-1]),
-        rsi_now=float(rsi.iloc[-1]),
-        rsi_prev=float(rsi.iloc[-2]),
         red_now=float(red.iloc[-1]),
         red_prev=float(red.iloc[-2]),
         red_prev2=float(red.iloc[-3]),
@@ -480,10 +478,6 @@ def build_frame(df: pd.DataFrame) -> Frame:
         angle_was=float("nan"),
         bar_index=bar_index,
     )
- 
- 
-def arm_fires(fr: Frame) -> bool:
-    return fr.rsi_prev < RSI_ARM <= fr.rsi_now
  
  
 def black_gate_open(fr: Frame) -> bool:
@@ -502,13 +496,6 @@ def black_gate_open(fr: Frame) -> bool:
  
 def red_rising(fr: Frame) -> bool:
     return fr.red_now > fr.red_prev > fr.red_prev2
- 
- 
-@dataclass
-class Arm:
-    last_rsi_cross: int = -1
-    last_black: int = -1
-    last_red: int = -1
  
  
 def et_now():
@@ -616,18 +603,19 @@ def pair_leg_open(sym):
  
  
 def signal_worker(api):
-    """Watches every symbol, auto-buys the instant the 3-part signal fires --
-    now WITH the slot cap and same-pair lock the plain system has, AND with
-    each symbol's arm state reset at the start of every new trading day so
-    a condition from a previous day can never combine with today's (fixed
-    2026-08-26 -- this was letting stale "black line was steep" flags from
-    days ago slip through and fire false signals)."""
-    arms = {s: Arm() for s in SYMBOLS}
+    """Watches every symbol, asks for your approval the instant the 2-part
+    signal fires -- black line's current angle is shallow enough, AND the
+    red line is rising 2 bars in a row, both true on the SAME bar
+    (2026-08-31, Gary's decision: RSI dropped entirely -- extensive
+    testing found it added no real predictive value, mostly just delay).
+    No arm-tracking or multi-bar alignment window needed now that there
+    are only two conditions to check, and they're required
+    simultaneously."""
     last_signaled_bar = {s: None for s in SYMBOLS}
-    last_seen_date = {s: None for s in SYMBOLS}
  
     log(f"Signal worker started. Black-line check: current angle must be shallower "
-        f"than {SHALLOWED:.1f} degrees. MAX_SLOTS={MAX_SLOTS}, pair-lock ON.")
+        f"than {SHALLOWED:.1f} degrees. Red line rising 2 bars in a row. "
+        f"MAX_SLOTS={MAX_SLOTS}, pair-lock ON.")
  
     while _RUNNING:
         now_et = et_now()
@@ -652,29 +640,7 @@ def signal_worker(api):
             if fr.bar_index < WARMUP_BARS:
                 continue
  
-            # FIX (2026-08-26): brand-new day for this symbol -> wipe its
-            # arm memory so nothing from yesterday (or any earlier day) can
-            # ever combine with today's conditions.
-            today_date = fr.ts.date() if hasattr(fr.ts, "date") else now_et.date()
-            if last_seen_date[sym] != today_date:
-                arms[sym] = Arm()
-                last_signaled_bar[sym] = None
-                last_seen_date[sym] = today_date
- 
-            a = arms[sym]
-            if arm_fires(fr):
-                a.last_rsi_cross = fr.bar_index
-            if black_gate_open(fr):
-                a.last_black = fr.bar_index
-            if red_rising(fr):
-                a.last_red = fr.bar_index
- 
-            if a.last_black == -1 or a.last_red == -1 or a.last_rsi_cross == -1:
-                continue
-            seen = [a.last_rsi_cross, a.last_black, a.last_red]
-            if max(seen) - min(seen) > (SIMUL_BARS - 1):
-                continue
-            if fr.bar_index != max(seen):
+            if not (black_gate_open(fr) and red_rising(fr)):
                 continue
  
             sig_key = (str(now_et.date()), fr.bar_index)
@@ -693,7 +659,7 @@ def signal_worker(api):
             log(f"SIGNAL {sym} @ {fr.close:.4f} bar={fr.bar_index} -- ASKING FOR YOUR APPROVAL "
                 f"(double-cyborg mode, {SHARES_PER_TRADE} share)")
             pending_buy_meta[sym] = {
-                "entry_rsi": fr.rsi_now, "entry_angle_now": fr.angle_now,
+                "entry_angle_now": fr.angle_now,
                 "entry_angle_was": fr.angle_was,
             }
             approval_queue.put((sym, fr.close, None, "BUY", "signal fired"))
@@ -706,10 +672,10 @@ STATUS_BOARD_SECONDS = 60   # how often the live status board prints
  
 def status_board_worker():
     """Prints a one-line status board every minute showing what every
-    ticker is currently doing (RSI, black-line angle, red-line direction) --
+    ticker is currently doing (black-line angle, red-line direction) --
     same idea as the plain system's live board, added 2026-08-27 per Gary's
-    request so you can watch RSI creep toward 35 and the angle move toward
-    the thresholds, even on minutes where nothing fires."""
+    request so you can watch the angle move toward the threshold, even on
+    minutes where nothing fires."""
     while _RUNNING:
         time.sleep(STATUS_BOARD_SECONDS)
         now_et = et_now()
@@ -730,8 +696,7 @@ def status_board_worker():
             red_dir = "up" if fr.red_now > fr.red_prev else "down"
             held = " [HOLDING]" if sym in open_positions else ""
             lines.append(
-                f"{sym}:RSI={fr.rsi_now:4.1f} angle={fr.angle_now:+5.1f}deg "
-                f"was={fr.angle_was:+5.1f}deg red={red_dir}{held}"
+                f"{sym}:angle={fr.angle_now:+5.1f}deg red={red_dir}{held}"
             )
  
         log("--- status board ---")
@@ -805,7 +770,6 @@ def decision_worker(api):
                 open_positions[symbol] = {
                     "entry": price, "peak": price, "qty": SHARES_PER_TRADE,
                     "opened_ts": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
-                    "entry_rsi": meta.get("entry_rsi", ""),
                     "entry_angle_now": meta.get("entry_angle_now", ""),
                     "entry_angle_was": meta.get("entry_angle_was", ""),
                 }
@@ -834,7 +798,6 @@ def decision_worker(api):
                     "time_closed": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
                     "ticker": symbol, "entry": f"{entry:.4f}", "exit_price": f"{price:.4f}",
                     "qty": qty, "pnl_pct": f"{pnl_pct:+.2f}", "reason": "approved sell",
-                    "rsi_at_entry": pos.get("entry_rsi", ""),
                     "angle_now_at_entry": pos.get("entry_angle_now", ""),
                     "angle_was_at_entry": pos.get("entry_angle_was", ""),
                 })
@@ -903,3 +866,4 @@ def main():
  
 if __name__ == "__main__":
     main()
+ 
