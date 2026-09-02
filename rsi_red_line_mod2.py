@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 ============================================================
-  ENGINE B -- DOUBLE CYBORG  (built 2026-08-30, updated 2026-08-31)
-  Neither buy NOR sell happens automatically. Every signal
-  asks for your approval right here in this terminal (type
-  Y and press Enter to act, or just press Enter to skip/hold).
+  ENGINE A -- AUTO-BUY  (this is "SINGLE-CYBORG" mode)
+  Buy happens AUTOMATICALLY the instant a signal fires.
+  Sell always asks for your approval, right here in this
+  terminal (type Y and press Enter, or press Enter to hold).
 ============================================================
 
 ONE SELF-CONTAINED FILE. This does NOT import any other script --
@@ -29,16 +29,9 @@ SIGNAL (2-part rule, RSI removed 2026-08-31 -- Gary's decision):
     versions perform similarly -- the real benefit here is genuinely more
     candidates of comparable quality, not dramatically better ones, which
     is exactly what matters for a Cyborg design where you review every
-    candidate yourself before any money moves.
+    candidate yourself.
 
-WHY DOUBLE CYBORG: since every candidate gets a human look before any
-    money moves, a false-positive signal here only costs you a glance
-    and a "no", not a real trade. That's a different risk profile from
-    Engine A (which buys the instant it fires, with no human check
-    first) -- more candidates of comparable quality is a genuine
-    advantage here in a way it wouldn't be for Engine A.
-
-ENTRY: asks for your approval the instant the signal fires. Size is a
+ENTRY: automatic market buy the instant the signal fires. Size is a
     FIXED 1 SHARE per trade (Gary's choice, 2026-08-26) -- simple,
     minimal exposure while this new combined version is being trusted.
 
@@ -54,16 +47,15 @@ SAFETY PROTECTIONS (ported over from the plain system, 2026-08-26 --
     - Same-pair lock: won't buy NBIL if NBIZ is already open (and
       vice versa for every inverse pair), same as the plain system.
 
-BUG FIX (2026-08-26 evening, THIS VERSION):
+BUG FIX (2026-08-26 evening, historical -- fixed in an earlier version,
+    no longer directly relevant since the "was steep" concept it was
+    protecting is gone entirely as of 2026-08-30):
     Found by backtesting Aug 24/25 against real signals: the "black line
     was steep" check could reach back across a DIFFERENT trading day (even
-    a week+ earlier) and combine with today's real RSI/red-line conditions,
-    firing a false signal. Confirmed on SOXL, IRE, NBIZ, RKLX(8/25), CWVX,
-    and AAOX. Fixed two places (search "FIX (2026-08-26)" in this file):
-    every symbol's memory of these conditions is now wiped clean at the
-    start of each new trading day, and the steep-angle lookback can no
-    longer reach past today's own opening bar. This is the version to run
-    starting 2026-08-27.
+    a week+ earlier) and combine with today's real conditions, firing a
+    false signal. This entire mechanism (the historical "was steep"
+    lookback) was later removed altogether, so this specific bug class
+    can no longer occur.
 
 LOGGING: writes a complete round-trip row (entry + exit + reason) to
     its own CSV log the moment each trade actually closes -- a
@@ -73,7 +65,7 @@ LOGGING: writes a complete round-trip row (entry + exit + reason) to
 HOW TO RUN:
     cd ~/rsi_system
     set -a; source .env; set +a
-    ~/algotrend1v5/venv/bin/python3 rsi_mod2_B_approvebuy.py
+    ~/algotrend1v5/venv/bin/python3 rsi_mod2_A_autobuy.py
 
 Needs to run on a computer/server that stays on and connected during
 market hours.
@@ -127,20 +119,25 @@ SHARES_PER_TRADE = 1   # fixed 1 share per trade (Gary's choice, 2026-08-26)
 MAX_SLOTS = 10   # same cap as the plain system -- ported over 2026-08-26,
                  # this combined file was missing it before
 
-RSI_MOD2_MODE = "DOUBLE_CYBORG"  # both buy AND sell need your approval
+RSI_MOD2_MODE = "SINGLE_CYBORG"  # buy is automatic; only sell needs approval
 
 # Same PAIRS/SYMBOLS/PARTNER as the plain system, so both files always
 # watch the exact same tickers with the exact same pair-lock logic.
+# UNIVERSE REDUCED (2026-09-02, Gary's decision): dropped from 19 down
+# to just the 9 highest-volatility tickers (5 pairs + AAOX). Two
+# independent reasons converged on this exact same cutoff: (1) this
+# was the natural volatility ranking cutoff identified much earlier in
+# this project (a clean gap between CWVX at 15.2% and IONZ at 14.5%),
+# and (2) tested tonight -- cutting to just these 9 roughly HALVES the
+# typical signal clustering (10.8 -> 5.5 tickers in any 10-min window)
+# and mathematically GUARANTEES the worst case can never exceed 9,
+# while trade quality is the same or slightly BETTER (avg peak
+# actually improved, from 6.55% to 7.27%, in the smaller group).
 PAIRS = [
     ("NBIL", "NBIZ"),
-    ("SOXL", "SOXS"),
-    ("RKLX", "RKLZ"),
     ("IRE",  "IREZ"),
-    ("IONX", "IONZ"),
     ("SNXX", "SNDQ"),
     ("CWVX", "CORD"),
-    ("OKLL", "OKLS"),
-    ("SKUU", "SKDD"),
     ("AAOX",),
 ]
 SYMBOLS = [s for pr in PAIRS for s in pr]
@@ -163,7 +160,7 @@ EOD_FLATTEN_ET = "15:59"
 POLL_SECONDS = int(os.getenv("POLL_SECONDS") or 20)
 
 # Separate log file from the plain system's, so they never collide.
-LOG_CSV = os.getenv("MOD2_CYBORG_LOG") or "rsi_mod2_B_approvebuy_log.csv"
+LOG_CSV = os.getenv("MOD2_CYBORG_LOG") or "rsi_mod2_A_autobuy_log.csv"
 LOG_COLUMNS = [
     "time_opened", "time_closed", "ticker", "entry", "exit_price",
     "qty", "pnl_pct", "reason",
@@ -534,7 +531,6 @@ approval_queue = queue.Queue()
 decision_queue = queue.Queue()
 open_positions = {}   # symbol -> dict with entry/peak/qty/opened_ts/entry indicator snapshot
 latest_frame = {}     # symbol -> most recent Frame, for the live status board
-pending_buy_meta = {} # symbol -> indicator snapshot at signal time, held until you approve/skip the buy
 
 
 class TerminalApproval:
@@ -602,14 +598,13 @@ def pair_leg_open(sym):
 
 
 def signal_worker(api):
-    """Watches every symbol, asks for your approval the instant the 2-part
-    signal fires -- black line's current angle is shallow enough, AND the
-    red line is rising 2 bars in a row, both true on the SAME bar
-    (2026-08-31, Gary's decision: RSI dropped entirely -- extensive
-    testing found it added no real predictive value, mostly just delay).
-    No arm-tracking or multi-bar alignment window needed now that there
-    are only two conditions to check, and they're required
-    simultaneously."""
+    """Watches every symbol, auto-buys the instant the 2-part signal fires --
+    black line's current angle is shallow enough, AND the red line is
+    rising 2 bars in a row, both true on the SAME bar (2026-08-31, Gary's
+    decision: RSI dropped entirely -- extensive testing found it added no
+    real predictive value, mostly just delay). No arm-tracking or
+    multi-bar alignment window needed now that there are only two
+    conditions to check, and they're required simultaneously."""
     last_signaled_bar = {s: None for s in SYMBOLS}
 
     log(f"Signal worker started. Black-line check: current angle must be shallower "
@@ -655,13 +650,21 @@ def signal_worker(api):
                 log(f"PAIR-SKIP {sym} (partner {PARTNER[sym]} already open)")
                 continue
 
-            log(f"SIGNAL {sym} @ {fr.close:.4f} bar={fr.bar_index} -- ASKING FOR YOUR APPROVAL "
-                f"(double-cyborg mode, {SHARES_PER_TRADE} share)")
-            pending_buy_meta[sym] = {
-                "entry_angle_now": fr.angle_now,
-                "entry_angle_was": fr.angle_was,
-            }
-            approval_queue.put((sym, fr.close, None, "BUY", "signal fired"))
+            log(f"SIGNAL {sym} @ {fr.close:.4f} bar={fr.bar_index} -- AUTO-BUYING "
+                f"(single-cyborg mode, {SHARES_PER_TRADE} share)")
+            try:
+                result = api.market_buy(sym, SHARES_PER_TRADE)
+                log(f"Buy order result for {sym}: {result} ({SHARES_PER_TRADE} share @ ${fr.close:.2f})")
+                open_positions[sym] = {
+                    "entry": fr.close, "peak": fr.close, "qty": SHARES_PER_TRADE,
+                    "opened_ts": now_et.strftime("%Y-%m-%d %H:%M:%S"),
+                    "entry_angle_now": fr.angle_now,
+                    "entry_angle_was": fr.angle_was,
+                }
+                log(f"Now tracking open position: {sym} entry=${fr.close:.2f} -- "
+                    f"will alert on sell via this terminal")
+            except Exception as e:
+                log(f"ERROR auto-buying {sym}: {e}")
 
         time.sleep(POLL_SECONDS)
 
@@ -751,39 +754,14 @@ def sell_monitor_worker(api):
 
 def decision_worker(api):
     """Waits for your typed answer, only THEN talks to TradeStation. Logs a
-    complete round-trip row to the CSV the moment a position actually closes.
-    DOUBLE-CYBORG (2026-08-30): now also waits for your approval on the BUY
-    side, not just the sell -- nothing is bought without you typing Y."""
+    complete round-trip row to the CSV the moment a position actually closes."""
     while _RUNNING:
         try:
             action, symbol, price, ts = decision_queue.get(timeout=1)
         except queue.Empty:
             continue
 
-        if action == "APPROVE_BUY":
-            log(f"APPROVED by you -- buying {symbol} @ ~{price:.4f}")
-            try:
-                result = api.market_buy(symbol, SHARES_PER_TRADE)
-                log(f"Buy order result for {symbol}: {result} ({SHARES_PER_TRADE} share @ ${price:.2f})")
-                meta = pending_buy_meta.pop(symbol, {})
-                open_positions[symbol] = {
-                    "entry": price, "peak": price, "qty": SHARES_PER_TRADE,
-                    "opened_ts": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
-                    "entry_angle_now": meta.get("entry_angle_now", ""),
-                    "entry_angle_was": meta.get("entry_angle_was", ""),
-                }
-                log(f"Now tracking open position: {symbol} entry=${price:.2f} -- "
-                    f"will alert on sell via this terminal")
-            except Exception as e:
-                log(f"ERROR buying {symbol}: {e}")
-                pending_buy_meta.pop(symbol, None)
-        elif action == "SKIP_BUY":
-            log(f"SKIPPED by you: {symbol} @ ~{price} -- not buying this signal")
-            pending_buy_meta.pop(symbol, None)
-        elif action == "EXPIRED_BUY":
-            log(f"Buy alert EXPIRED (no answer within {POPUP_TIMEOUT_SECONDS}s): {symbol} -- not buying")
-            pending_buy_meta.pop(symbol, None)
-        elif action == "APPROVE_SELL":
+        if action == "APPROVE_SELL":
             log(f"APPROVED by you -- selling {symbol} @ ~{price:.4f}")
             pos = open_positions.get(symbol, {})
             qty = pos.get("qty", SHARES_PER_TRADE)
@@ -826,7 +804,7 @@ def main():
 
     bal = api.get_balance()
     log("=" * 70)
-    log("RSI MOD2 -- ENGINE B (Double Cyborg, self-contained file)")
+    log("RSI MOD2 -- ENGINE A (single, self-contained file)")
     log("=" * 70)
     if bal:
         log(f"BALANCE  equity=${bal['equity']:,.2f}  cash=${bal['cash']:,.2f}")
