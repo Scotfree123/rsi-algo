@@ -1,145 +1,106 @@
 
 #!/usr/bin/env python3
-"""
-============================================================
-  ENGINE B -- DOUBLE CYBORG  (built 2026-08-30, updated 2026-08-31)
-  Neither buy NOR sell happens automatically. Every signal
-  asks for your approval right here in this terminal (type
-  Y and press Enter to act, or just press Enter to skip/hold).
-============================================================
+# =============================================================================
+#  RSI RED LINE  --  MOD 2
+#
+#  Built to the mod2 spec. This is a SEPARATE engine from rsiAlgo.py -- it does
+#  not share its signal, its exits, or its parameters. It reuses only the
+#  proven TradeStation plumbing (auth, bar fetch, session filter, indicators).
+#
+#  Behaviour (per spec + Gary's choices):
+#    - Signal: RSI(7) arm at 35, black-line angle "was-steep then shallowed"
+#      gate, red-line (HMA7) rising. All three true on the same bar -> FIRE.
+#    - Entry:  AUTO. Market buy on fire; recorded fill is the entry price.
+#              (Spec's reference entry is next bar's open; live fills at market.)
+#    - Size:   ~$1000 notional per entry. Share count = floor(TRADE_NOTIONAL /
+#              price at fire), minimum 1 share. Updated 2026-08-18 (was fixed
+#              1 share -- "learning run" sizing).
+#    - Exit:   ONLY mechanical exit is the hard floor at entry x 0.95.
+#              Selling is MANUAL (Gary, by hand). EOD flat.
+#    - Suppression: per-ticker while open, global slot cap (10), same-pair lock.
+#              Slot cap raised 2026-08-18 from 3 -> 10 (Gary's choice). Note:
+#              the broker-sync below already detects Gary's manual sells and
+#              frees the slot mid-day -- that logic did not change, only the
+#              cap did.
+#
+#  Deliberately ABSENT (spec sections 9 & 10 forbid these):
+#    - No volatility-based stop or gate of any kind.
+#    - No trailing exit, no bars-held exit, no mechanical sell whatsoever.
+#    - No chop, meander, or price-to-red distance filter.
+#    - No upper-bound angle gate. No degree-based sell logic.
+#    - Nothing from the Black Line Trend System.
+#  The ONLY mechanical exit in this file is the hard floor at entry x 0.95.
+#
+#  Run:
+#      cd ~/rsi_system
+#      set -a; source .env; set +a
+#      ~/algotrend1v5/venv/bin/python3 rsi_red_line_mod2.py
+# =============================================================================
  
-ONE SELF-CONTAINED FILE. This does NOT import any other script --
-everything it needs (TradeStation connection, indicators, signal
-detection, the ticker list) lives right here, so there is nothing
-else to keep in sync and nothing else that needs to be "connected."
- 
-SIGNAL (2-part rule, RSI removed 2026-08-31 -- Gary's decision):
-    Black line (EMA20)'s CURRENT angle is shallower than SHALLOWED(-15
-    degrees) -- not in a strong downtrend right now, no requirement it
-    was ever steep beforehand -- AND red line (HMA7) rising 2 bars in a
-    row, both checked on the SAME bar. RSI used to be a third, required
-    condition here; extensive testing found essentially zero relationship
-    (correlation 0.064) between how "oversold" RSI got before a cross and
-    how well the trade performed afterward -- the theory behind requiring
-    it didn't hold up. Confirmed by construction: this simpler rule can
-    never fire LATER than the old 3-part rule would have on the same day,
-    only ever at the same time or earlier -- and testing found 71 real,
-    good trades the old rule missed entirely because RSI simply never
-    crossed 35 that day. One honest caveat found during testing: once
-    measured with a REALISTIC exit (not "held the whole day"), the two
-    versions perform similarly -- the real benefit here is genuinely more
-    candidates of comparable quality, not dramatically better ones, which
-    is exactly what matters for a Cyborg design where you review every
-    candidate yourself before any money moves.
- 
-WHY DOUBLE CYBORG: since every candidate gets a human look before any
-    money moves, a false-positive signal here only costs you a glance
-    and a "no", not a real trade. That's a different risk profile from
-    Engine A (which buys the instant it fires, with no human check
-    first) -- more candidates of comparable quality is a genuine
-    advantage here in a way it wouldn't be for Engine A.
- 
-ENTRY: asks for your approval the instant the signal fires. Size is a
-    FIXED 1 SHARE per trade (Gary's choice, 2026-08-26) -- simple,
-    minimal exposure while this new combined version is being trusted.
- 
-EXIT: -2% hard stop, OR a 2.5% trailing-stop pullback from the peak
-    once in profit, OR end-of-day flatten -- but selling ALWAYS asks
-    for your approval first, right here in the terminal. This is
-    DELIBERATELY DIFFERENT from the plain system's -5% hard-floor/
-    manual-only exit -- that's the whole point of Cyborg mode.
- 
-SAFETY PROTECTIONS (ported over from the plain system, 2026-08-26 --
-    these were missing from earlier versions of this combined file):
-    - MAX_SLOTS = 10: won't open more than 10 positions at once.
-    - Same-pair lock: won't buy NBIL if NBIZ is already open (and
-      vice versa for every inverse pair), same as the plain system.
- 
-BUG FIX (2026-08-26 evening, THIS VERSION):
-    Found by backtesting Aug 24/25 against real signals: the "black line
-    was steep" check could reach back across a DIFFERENT trading day (even
-    a week+ earlier) and combine with today's real RSI/red-line conditions,
-    firing a false signal. Confirmed on SOXL, IRE, NBIZ, RKLX(8/25), CWVX,
-    and AAOX. Fixed two places (search "FIX (2026-08-26)" in this file):
-    every symbol's memory of these conditions is now wiped clean at the
-    start of each new trading day, and the steep-angle lookback can no
-    longer reach past today's own opening bar. This is the version to run
-    starting 2026-08-27.
- 
-LOGGING: writes a complete round-trip row (entry + exit + reason) to
-    its own CSV log the moment each trade actually closes -- a
-    separate file from the plain system's log, so the two never
-    collide or overwrite each other.
- 
-HOW TO RUN:
-    cd ~/rsi_system
-    set -a; source .env; set +a
-    ~/algotrend1v5/venv/bin/python3 rsi_mod2_B_approvebuy.py
- 
-Needs to run on a computer/server that stays on and connected during
-market hours.
-"""
 import os
 import sys
 import csv
-import time
-import math
-import signal as _sig
-import threading
-import queue
-from dataclasses import dataclass
-from datetime import datetime
-from zoneinfo import ZoneInfo
- 
-import numpy as np
-import pandas as pd
-import requests
-from dotenv import load_dotenv
- 
-load_dotenv()
- 
-AZ = ZoneInfo("America/Phoenix")
-ET = ZoneInfo("America/New_York")
- 
-TS_OAUTH_URL = "https://signin.tradestation.com/oauth/token"
-TS_BASE = {
-    "sim":  "https://sim-api.tradestation.com/v3",
+@@ -63,34 +26,28 @@
     "live": "https://api.tradestation.com/v3",
 }
- 
+
 # ------------------------------------------------------------ constants ------
+# Straight from the spec. CEILING is intentionally absent and must stay absent.
  
+RSI_LEN        = 7
+RSI_ARM        = 35
+SIMUL_BARS     = 3         # all three conditions must occur within this many
+                           # bars of each other (replaces the old wait window)
 EMA_LEN        = 20        # black
 HMA_LEN        = 7         # red
+ANGLE_LOOKBACK = 5         # bars
+STEEP_LOOKBACK = 30        # bars, excludes current bar
+WAS_STEEP      = -20.0     # degrees
+SHALLOWED      = -15.0     # degrees
+SIMUL_BARS     = 3
+EMA_LEN        = 20
+HMA_LEN        = 7
 ANGLE_LOOKBACK = 5
+STEEP_LOOKBACK = 30
+WAS_STEEP      = -20.0
 SHALLOWED      = -15.0
 WARMUP_BARS    = 30
+HARD_FLOOR     = -5.0      # percent; the ONLY mechanical exit
+DISPLAY_TARGET = 2.5       # DISPLAY ONLY -- must not touch control flow
+MAX_SLOTS      = 10        # raised 2026-08-18 from 3 -> 10 (Gary's choice)
  
-# ---- Cyborg exit rule (deliberately different from the plain system's
-# -5% hard-floor/manual-only exit) ----
-STOP_PCT = 2.0
-TRAIL_PCT = 2.5
-SELL_ALERT_COOLDOWN_SECONDS = 90
-POPUP_TIMEOUT_SECONDS = 600   # if you don't answer a sell prompt in this long,
-                               # it auto-expires and keeps holding
+# Position sizing: dollar notional per entry rather than a fixed share count.
+# qty = floor(TRADE_NOTIONAL / price-at-fire), minimum 1 share. Overridable
+# via env for testing without touching this file.
+TRADE_NOTIONAL = float(os.getenv("TRADE_NOTIONAL") or 1000.0)
  
-SHARES_PER_TRADE = 1   # fixed 1 share per trade (Gary's choice, 2026-08-26)
+# Groups. A 2-tuple is a long/inverse pair (mutually exclusive, one slot);
+# a 1-tuple is a lone symbol that just occupies a slot with no partner.
+# SNXX/SNDQ per spec (note SNDQ, not SNDR). OKLL/OKLS, SKUU/SKDD, AAOX added.
+# !! VERIFY: confirm every symbol resolves at TradeStation and that each
+#    pair's two legs are genuine inverses of the same underlying before live.
+HARD_FLOOR     = -5.0
+DISPLAY_TARGET = 2.5
+MAX_SLOTS      = 3
  
-MAX_SLOTS = 10   # same cap as the plain system -- ported over 2026-08-26,
-                 # this combined file was missing it before
+# ---- Real-chart-geometry calibration, confirmed directly against Gary's actual
+# chart on 2026-08-24: 11in wide x 4.5in tall, showing the full 9:30-4:00 day.
+# This replaces the old plain-math angle formula, which measured "steepness"
+# in a way that never matched what these thresholds were designed by eye to mean.
+CHART_W_IN = 11.0
+CHART_H_IN = 4.5
+FULL_DAY_MINUTES = 390
  
-RSI_MOD2_MODE = "DOUBLE_CYBORG"  # both buy AND sell need your approval
- 
-# Same PAIRS/SYMBOLS/PARTNER as the plain system, so both files always
-# watch the exact same tickers with the exact same pair-lock logic.
 PAIRS = [
     ("NBIL", "NBIZ"),
     ("SOXL", "SOXS"),
-    ("RKLX", "RKLZ"),
-    ("IRE",  "IREZ"),
+@@ -99,27 +56,26 @@
     ("IONX", "IONZ"),
     ("SNXX", "SNDQ"),
     ("CWVX", "CORD"),
+    ("OKLL", "OKLS"),      # added
+    ("SKUU", "SKDD"),      # added
+    ("AAOX",),             # added -- singleton, no inverse leg
     ("OKLL", "OKLS"),
     ("SKUU", "SKDD"),
     ("AAOX",),
@@ -150,505 +111,419 @@ for _grp in PAIRS:
     if len(_grp) == 2:
         PARTNER[_grp[0]] = _grp[1]
         PARTNER[_grp[1]] = _grp[0]
- 
+    # singletons have no partner; PARTNER.get(sym) will return None
+
 _dupes = [s for s in set(SYMBOLS) if SYMBOLS.count(s) > 1]
 if _dupes:
     raise SystemExit(f"FATAL: duplicate symbols in PAIRS: {sorted(_dupes)}")
- 
+
 BAR_MINUTES = 1
+BAR_LOOKBACK = 400            # enough for warmup + a full session
 BAR_LOOKBACK = 400
 MARKET_OPEN_ET = "09:30"
 MARKET_CLOSE_ET = "16:00"
+NO_NEW_AFTER_ET = "15:58"     # need a next bar in the same session
 NO_NEW_AFTER_ET = "15:58"
 EOD_FLATTEN_ET = "15:59"
 POLL_SECONDS = int(os.getenv("POLL_SECONDS") or 20)
- 
-# Separate log file from the plain system's, so they never collide.
-LOG_CSV = os.getenv("MOD2_CYBORG_LOG") or "rsi_mod2_B_approvebuy_log.csv"
-LOG_COLUMNS = [
-    "time_opened", "time_closed", "ticker", "entry", "exit_price",
-    "qty", "pnl_pct", "reason",
-    "angle_now_at_entry", "angle_was_at_entry",
-]
- 
- 
-def log(msg):
-    ts = datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S AZ")
+LOG_CSV = os.getenv("MOD2_LOG") or "rsi_red_line_mod2_log.csv"
+@@ -136,14 +92,11 @@ def log(msg):
     print(f"{ts} | {msg}", flush=True)
- 
- 
-def ensure_csv():
-    if not os.path.exists(LOG_CSV):
-        with open(LOG_CSV, "w", newline="") as f:
-            csv.writer(f).writerow(LOG_COLUMNS)
- 
- 
-def append_trade_row(row: dict):
-    with open(LOG_CSV, "a", newline="") as f:
-        csv.writer(f).writerow([row.get(c, "") for c in LOG_COLUMNS])
- 
- 
+
+
 # ------------------------------------------------------------ indicators -----
+# ema and rsi_wilder are identical to the proven versions in rsiAlgo.py.
  
 def ema(s: pd.Series, n: int) -> pd.Series:
+def ema(s, n):
     return s.ewm(span=n, adjust=False).mean()
- 
- 
+
+
 def rsi_wilder(close: pd.Series, n: int) -> pd.Series:
+def rsi_wilder(close, n):
     d = close.diff()
     gain = d.clip(lower=0.0)
     loss = (-d).clip(lower=0.0)
-    ag = gain.ewm(alpha=1 / n, adjust=False).mean()
-    al = loss.ewm(alpha=1 / n, adjust=False).mean()
-    rs = ag / al.replace(0, np.nan)
+@@ -153,40 +106,33 @@ def rsi_wilder(close: pd.Series, n: int) -> pd.Series:
     return (100 - 100 / (1 + rs)).fillna(100)
- 
- 
+
+
 def wma(s: pd.Series, n: int) -> pd.Series:
+def wma(s, n):
     w = np.arange(1, n + 1, dtype=float)
     return s.rolling(n).apply(lambda x: np.dot(x, w) / w.sum(), raw=True)
- 
- 
+
+
 def hma(s: pd.Series, n: int) -> pd.Series:
+    """Hull MA: WMA(2*WMA(n/2) - WMA(n), sqrt(n)).
+ 
+    The spec writes the HMA(7) as WMA(2*WMA(close,3) - WMA(close,7), 3):
+    half = round(7/2) = 3 (wait: round(3.5)=4 in banker's rounding, but the
+    spec pins half=3 and final=3 explicitly), so we use the spec's exact
+    windows rather than the textbook rounding. Do not "fix" this to 4/2."""
+def hma(s, n):
     half = 3
     root = 3
     return wma(2 * wma(s, half) - wma(s, n), root)
- 
- 
+
+
 def black_angle(black: pd.Series) -> pd.Series:
-    """Angle of the black line, in degrees. Uses a best-fit straight line
-    through the whole ANGLE_LOOKBACK(5)-minute window (all 6 points), not
-    just the two endpoints -- validated 2026-08-30: this uses every
-    available data point instead of throwing most of them away, so it
-    can't be blind to a real move that happens to sit in the middle of
-    the window. Tested against the two-point method across the full
-    trade history: 72 trades vs 71, essentially identical -- this change
-    is safe, and is the more thorough of the two methods."""
-    window_size = ANGLE_LOOKBACK + 1
-    x = np.arange(window_size, dtype=float)
-    x_mean = x.mean()
-    x_centered = x - x_mean
-    denom = (x_centered ** 2).sum()
+    """Angle of the black line in MATH degrees, per spec section 3.
  
-    def _slope_pct_per_min(vals):
-        if np.isnan(vals).any():
-            return np.nan
-        y_mean = vals.mean()
-        slope = (x_centered * (vals - y_mean)).sum() / denom
-        if y_mean == 0:
-            return np.nan
-        return (slope / y_mean) * 100.0
- 
-    pct_per_bar = black.rolling(window_size).apply(_slope_pct_per_min, raw=True)
+    pct_per_bar = (black[i]/black[i-5] - 1) * 100 / 5
+    angle       = degrees(arctan(pct_per_bar))
+    Calibration: 1% per bar == 45 degrees. These are not protractor degrees.
+    Do not correct them."""
+def black_angle(black, day_high_so_far, day_low_so_far):
+    """Angle of the black line, calibrated to match Gary's REAL chart --
+    11in wide x 4.5in tall, showing the full 9:30-4:00 trading day, with the
+    y-axis scaled to that day's own high-to-low range so far. This is what
+    WAS_STEEP and SHALLOWED were actually designed by eye to mean."""
+    in_per_min = CHART_W_IN / FULL_DAY_MINUTES
+    rng = (day_high_so_far - day_low_so_far).replace(0, np.nan)
+    in_per_dollar = CHART_H_IN / rng
+    prev = black.shift(ANGLE_LOOKBACK)
+    pct_per_bar = (black / prev - 1.0) * 100.0 / ANGLE_LOOKBACK
     return np.degrees(np.arctan(pct_per_bar))
  
- 
+    delta = black - prev
+    horiz_in = ANGLE_LOOKBACK * in_per_min
+    vert_in = delta * in_per_dollar
+    return np.degrees(np.arctan(vert_in / horiz_in))
+
 # ------------------------------------------------------------ session --------
- 
+
 def session_filter(df):
+    """Keep only weekday bars inside 09:30-16:00 ET. Filters by time-of-day so
+    prior sessions keep the indicators warm at the open."""
     if df is None or df.empty:
         return df
     et = df.tz_convert(ET)
-    try:
-        et = et.between_time(MARKET_OPEN_ET, MARKET_CLOSE_ET, inclusive="both")
-    except TypeError:
-        et = et.between_time(MARKET_OPEN_ET, MARKET_CLOSE_ET)
-    et = et[et.index.weekday < 5]
-    return et.tz_convert("UTC")
- 
- 
-def bar_et(ts):
-    try:
-        return pd.Timestamp(ts).tz_convert(ET).strftime("%H:%M")
-    except Exception:
-        return str(ts)
- 
- 
-def _to_utc_index(values):
-    out = []
-    for v in values:
-        t = pd.Timestamp(v)
-        out.append(t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC"))
+@@ -213,10 +159,6 @@ def _to_utc_index(values):
     return pd.DatetimeIndex(out)
- 
- 
+
+
 # ------------------------------------------------------------ TS client ------
+# Trimmed to what mod2 needs: auth, bars, quote, account/balance, market buy,
+# market sell-to-flat. No ATR, no resting stop -- the spec forbids them.
  
 @dataclass
 class _Trade:
     price: float
- 
- 
-@dataclass
-class _Account:
-    account_number: str
-    status: str
- 
- 
-class TradeStationClient:
-    def __init__(self):
-        self.client_id = (os.getenv("TS_CLIENT_ID") or os.getenv("TS_API_KEY")
-                          or os.getenv("TRADESTATION_CLIENT_ID"))
-        self.client_secret = (os.getenv("TS_CLIENT_SECRET") or os.getenv("TS_SECRET")
-                              or os.getenv("TRADESTATION_CLIENT_SECRET"))
-        self.refresh_token = (os.getenv("TS_REFRESH_TOKEN")
-                              or os.getenv("TRADESTATION_REFRESH_TOKEN"))
-        self.account_id = (os.getenv("TS_ACCOUNT_ID")
-                           or os.getenv("TRADESTATION_ACCOUNT_ID"))
-        self.env = (os.getenv("TS_ENV") or "sim").lower()
-        self.dry_run = (os.getenv("DRY_RUN") or "1") != "0"
-        self.drop_forming_bar = (os.getenv("DROP_FORMING_BAR") or "1") != "0"
- 
-        if self.env not in TS_BASE:
-            raise SystemExit(f"TS_ENV must be 'sim' or 'live', got {self.env!r}")
-        self.base = TS_BASE[self.env]
- 
-        missing = [k for k, v in {
-            "TS_CLIENT_ID (or TS_API_KEY)": self.client_id,
-            "TS_CLIENT_SECRET (or TS_SECRET)": self.client_secret,
-            "TS_REFRESH_TOKEN": self.refresh_token,
-            "TS_ACCOUNT_ID": self.account_id,
-        }.items() if not v]
-        if missing:
-            raise SystemExit(f"FATAL: missing TradeStation creds in .env: {missing}")
- 
-        self._token = None
-        self._token_exp = 0.0
-        self._session = requests.Session()
- 
-    def _access_token(self):
-        if self._token and time.time() < self._token_exp - 60:
-            return self._token
-        log("Refreshing TradeStation access token...")
-        r = self._session.post(TS_OAUTH_URL, data={
-            "grant_type": "refresh_token",
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "refresh_token": self.refresh_token,
-        }, timeout=15)
-        r.raise_for_status()
-        tok = r.json()
-        self._token = tok["access_token"]
-        self._token_exp = time.time() + int(tok.get("expires_in", 1200))
-        log(f"Token valid for {int(tok.get('expires_in', 1200))}s")
-        return self._token
- 
-    def _headers(self):
-        return {"Authorization": f"Bearer {self._access_token()}"}
- 
-    def _get(self, path, params=None):
-        r = self._session.get(self.base + path, headers=self._headers(),
-                              params=params, timeout=20)
-        r.raise_for_status()
-        return r.json()
- 
-    def _post(self, path, body):
-        r = self._session.post(self.base + path, headers=self._headers(),
-                               json=body, timeout=20)
-        r.raise_for_status()
-        return r.json()
- 
-    def get_bars(self, symbol, limit=None):
-        params = {"interval": BAR_MINUTES, "unit": "Minute",
-                  "barsback": limit or BAR_LOOKBACK}
-        data = self._get(f"/marketdata/barcharts/{symbol}", params)
-        bars = data.get("Bars", [])
-        if not bars:
-            return None
-        rows, raw_ts = [], []
-        for b in bars:
-            raw_ts.append(b["TimeStamp"])
-            rows.append({
-                "open": float(b["Open"]), "high": float(b["High"]),
-                "low": float(b["Low"]), "close": float(b["Close"]),
-                "volume": float(b.get("TotalVolume", 0) or 0),
-            })
-        df = pd.DataFrame(rows, index=_to_utc_index(raw_ts)).sort_index()
-        if self.drop_forming_bar and len(df) > 1:
-            df = df.iloc[:-1]
-        return df
- 
-    def get_latest_trade(self, symbol):
-        data = self._get(f"/marketdata/quotes/{symbol}")
-        q = (data.get("Quotes") or [{}])[0]
-        last = q.get("Last") or q.get("Close") or 0.0
-        return _Trade(float(last))
- 
-    def get_account(self):
-        data = self._get("/brokerage/accounts")
-        accts = data.get("Accounts", [])
-        me = next((a for a in accts if a.get("AccountID") == self.account_id), None)
-        if me is None and accts:
-            me = next((a for a in accts
-                       if str(a.get("AccountType", "")).lower() == "margin"), accts[0])
-            log(f"WARN TS_ACCOUNT_ID={self.account_id!r} not in env={self.env}; "
-                f"using {me.get('AccountID')} (type={me.get('AccountType')})")
-            self.account_id = me.get("AccountID")
-        me = me or {}
-        return _Account(me.get("AccountID", self.account_id),
-                        me.get("Status", "UNKNOWN"))
- 
-    def get_balance(self):
-        try:
-            data = self._get(f"/brokerage/accounts/{self.account_id}/balances")
-            b = (data.get("Balances") or [{}])[0]
-            return {"equity": float(b.get("Equity", 0) or 0),
-                    "cash": float(b.get("CashBalance", 0) or 0),
-                    "buying_power": float(b.get("BuyingPower", 0) or 0)}
-        except Exception as e:
-            log(f"WARN could not read balances: {e}")
-            return None
- 
-    def list_positions(self):
-        data = self._get(f"/brokerage/accounts/{self.account_id}/positions")
-        out = {}
-        for p in data.get("Positions", []):
-            out[p.get("Symbol")] = {
-                "qty": abs(int(float(p.get("Quantity", 0) or 0))),
-                "avg": float(p.get("AveragePrice", 0) or 0),
-            }
-        return out
- 
-    def market_buy(self, symbol, qty):
-        body = {"AccountID": self.account_id, "Symbol": symbol,
-                "Quantity": str(int(qty)), "OrderType": "Market",
-                "TradeAction": "BUY", "TimeInForce": {"Duration": "DAY"},
-                "Route": "Intelligent"}
-        if self.dry_run:
-            log(f"DRY-RUN buy suppressed: BUY {qty} {symbol}")
-            return {"dry_run": True}
+@@ -373,11 +315,8 @@ def market_sell(self, symbol, qty):
         return self._post("/orderexecution/orders", body)
- 
-    def market_sell(self, symbol, qty):
-        body = {"AccountID": self.account_id, "Symbol": symbol,
-                "Quantity": str(int(qty)), "OrderType": "Market",
-                "TradeAction": "SELL", "TimeInForce": {"Duration": "DAY"},
-                "Route": "Intelligent"}
-        if self.dry_run:
-            log(f"DRY-RUN sell suppressed: SELL {qty} {symbol}")
-            return {"dry_run": True}
-        return self._post("/orderexecution/orders", body)
- 
- 
+
+
 # ------------------------------------------------------------ signal ---------
  
 @dataclass
 class Frame:
+    """Everything the signal needs for the latest closed bar."""
     ts: object
     close: float
     open_: float
-    low: float
-    red_now: float
+@@ -388,24 +327,29 @@ class Frame:
     red_prev: float
     red_prev2: float
     angle_now: float
+    angle_was: float     # min angle over the prior STEEP_LOOKBACK bars
+    bar_index: int       # position in the current session (0-based)
     angle_was: float
     bar_index: int
- 
- 
+
+
 def build_frame(df: pd.DataFrame) -> Frame:
+def build_frame(df):
     close = df["close"]
     black = ema(close, EMA_LEN)
     red = hma(close, HMA_LEN)
+    rsi = rsi_wilder(close, RSI_LEN)
     angle = black_angle(black)
+
+    # session index: how many bars since this session's 09:30 ET open
+    # running high/low FOR TODAY ONLY, matching how the y-axis on Gary's real
+    # chart auto-scales to the current day's range as it unfolds
+    dates_et = df.index.tz_convert(ET).date
+    day_high_so_far = df["high"].groupby(dates_et).cummax()
+    day_low_so_far = df["low"].groupby(dates_et).cummin()
+    angle = black_angle(black, day_high_so_far, day_low_so_far)
  
     et_idx = df.index.tz_convert(ET)
     today = et_idx[-1].date()
     session_mask = (et_idx.date == today)
     bar_index = int(session_mask.sum()) - 1
- 
-    # NOTE (2026-08-31, Gary's decision): RSI dropped from the signal
-    # entirely. Extensive testing found essentially zero relationship
-    # (correlation 0.064) between how "oversold" RSI got before a cross
-    # and how well the trade performed afterward -- the theory behind
-    # requiring it didn't hold up. The real, meaningful signal has always
-    # come from the black line and red line; RSI was mostly adding delay,
-    # not protection. Confirmed by construction: this simpler 2-part rule
-    # can never fire LATER than the old 3-part rule would have on the
-    # same day -- only ever at the same time or earlier.
+
+    was = angle.iloc[-(STEEP_LOOKBACK + 1):-1]   # prior 30 bars, excl current
+    was = angle.iloc[-(STEEP_LOOKBACK + 1):-1]
     return Frame(
         ts=df.index[-1],
         close=float(close.iloc[-1]),
-        open_=float(df["open"].iloc[-1]),
-        low=float(df["low"].iloc[-1]),
-        red_now=float(red.iloc[-1]),
-        red_prev=float(red.iloc[-2]),
-        red_prev2=float(red.iloc[-3]),
-        angle_now=float(angle.iloc[-1]),
-        angle_was=float("nan"),
-        bar_index=bar_index,
+@@ -422,64 +366,48 @@ def build_frame(df: pd.DataFrame) -> Frame:
     )
- 
- 
+
+
+def arm_fires(fr: Frame) -> bool:
+    """ARM event: RSI crosses up through 35. rsi[i-1] < 35 <= rsi[i]."""
+def arm_fires(fr):
+    return fr.rsi_prev < RSI_ARM <= fr.rsi_now
+
+
 def black_gate_open(fr: Frame) -> bool:
-    """CHANGED (2026-08-30, Gary's decision): dropped the "was steep
-    beforehand" requirement entirely. Now this ONLY checks the black
-    line's CURRENT angle -- if it's not in a strong downtrend right now
-    (shallower than SHALLOWED), the trade is allowed through. No history
-    check at all. Rationale: don't buy against a strong current
-    downtrend, but a weak/flat/rising black line is fine even if it was
-    never dramatically steep beforehand -- waiting for a full -30 degree
-    prior decline meant waiting until it was too late to get in."""
-    if math.isnan(fr.angle_now):
+    """Was steep in the last 30 bars, and has now shallowed above -15.
+    No upper bound: flat and rising both qualify."""
+def black_gate_open(fr):
+    if math.isnan(fr.angle_was):
         return False
-    return fr.angle_now > SHALLOWED
- 
- 
+    return (fr.angle_was <= WAS_STEEP) and (fr.angle_now > SHALLOWED)
+
+
 def red_rising(fr: Frame) -> bool:
+    """Red line rising TWO bars in a row (param #3, CHANGED from 1 bar).
+    red[i] > red[i-1] > red[i-2]."""
+def red_rising(fr):
     return fr.red_now > fr.red_prev > fr.red_prev2
+
+
+# ------------------------------------------------------------ state ----------
  
+@dataclass
+class Pos:
+    symbol: str
+    entry: float
+    floor: float
+    qty: int
+    opened_ts: object
+    armed_until: int = -1     # session bar index the arm expires on
+    armed_until: int = -1
+
+
+# per-symbol arm latch (independent of holding a position)
+@dataclass
+class Arm:
+    # 3-bar simultaneity clock (params #5/#6). Instead of an arm latching for a
+    # fixed window, we remember the most recent session-bar index at which each
+    # of the three conditions was individually satisfied. FIRE when all three
+    # fall within SIMUL_BARS of each other. -1 means "not seen this session".
+    last_rsi_cross: int = -1     # RSI crossed up through the level
+    last_black: int = -1         # black gate open
+    last_red: int = -1           # red rising 2 bars
+ 
+    last_rsi_cross: int = -1
+    last_black: int = -1
+    last_red: int = -1
+
+# ------------------------------------------------------------ CSV ------------
+
+def ensure_csv():
+    if not os.path.exists(LOG_CSV):
+        with open(LOG_CSV, "w", newline="") as f:
+            csv.writer(f).writerow(LOG_COLUMNS)
+
+
+def append_alert(row: dict):
+def append_alert(row):
+    with open(LOG_CSV, "a", newline="") as f:
+        csv.writer(f).writerow([row.get(c, "") for c in LOG_COLUMNS])
+
+
+# ------------------------------------------------------------ clock ----------
  
 def et_now():
     return datetime.now(ET)
- 
- 
-def _hhmm(s):
-    hh, mm = s.split(":")
-    return int(hh), int(mm)
- 
- 
-def in_session(now_et):
-    oh, om = _hhmm(MARKET_OPEN_ET)
-    ch, cm = _hhmm(MARKET_CLOSE_ET)
-    o = now_et.replace(hour=oh, minute=om, second=0, microsecond=0)
-    c = now_et.replace(hour=ch, minute=cm, second=0, microsecond=0)
-    return o <= now_et <= c and now_et.weekday() < 5
- 
- 
-def past(now_et, hhmm_str):
-    hh, mm = _hhmm(hhmm_str)
-    mark = now_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    return now_et >= mark
- 
- 
-_RUNNING = True
- 
- 
-def _stop(*_):
-    global _RUNNING
+
+@@ -511,8 +439,6 @@ def _stop(*_):
     _RUNNING = False
+
+
+# ------------------------------------------------------------ main -----------
  
+def main():
+    _sig.signal(_sig.SIGINT, _stop)
+    _sig.signal(_sig.SIGTERM, _stop)
+@@ -521,270 +447,10 @@ def main():
+    api._access_token()
+    acct = api.get_account()
+    ensure_csv()
  
-# ------------------------------------------------------------ Cyborg UI ------
+    _u = datetime.now(ZoneInfo("UTC"))
+    log("CLOCK  utc=%s | et=%s | az=%s"
+        % (_u.strftime("%H:%M:%S"),
+           _u.astimezone(ET).strftime("%H:%M:%S %Z"),
+           _u.astimezone(AZ).strftime("%H:%M:%S %Z")))
+    log("=" * 64)
+    log("RSI RED LINE -- MOD 2")
+    log("=" * 64)
+    log(f"account={acct.account_number} status={acct.status} "
+        f"env={api.env} dry_run={api.dry_run}")
+    bal = api.get_balance()
+    if bal:
+        log(f"BALANCE equity=${bal['equity']:,.2f} cash=${bal['cash']:,.2f}")
+        if api.env == "live" and not api.dry_run:
+            log("        ^ CHECK THIS ACCOUNT. Ctrl-C now if it is wrong.")
+    log(f"SIGNAL  arm=RSI{RSI_LEN} x-up thru {RSI_ARM}"
+        f" | black: was<= {WAS_STEEP:.0f} in {STEEP_LOOKBACK}b then now> {SHALLOWED:.0f}"
+        f" | red(HMA{HMA_LEN}) rising 2 bars"
+        f" | all 3 within {SIMUL_BARS} bars")
+    log(f"EXEC    entry=AUTO market buy, ~${TRADE_NOTIONAL:,.0f} notional "
+        f"(dynamic share count) | floor={HARD_FLOOR:.0f}% "
+        f"(ONLY mechanical exit) | sell=MANUAL | EOD flat {EOD_FLATTEN_ET} ET")
+    log(f"SUPPRESS per-ticker + global slots<= {MAX_SLOTS} + same-pair lock")
+    log(f"UNIVERSE {', '.join(SYMBOLS)}")
+    log(f"LOG     {LOG_CSV}")
+    if api.env == "live" and not api.dry_run:
+        log("*** LIVE TRADING ENABLED -- real orders will be sent ***")
+    log("=" * 64)
  
-approval_queue = queue.Queue()
-decision_queue = queue.Queue()
-open_positions = {}   # symbol -> dict with entry/peak/qty/opened_ts/entry indicator snapshot
-latest_frame = {}     # symbol -> most recent Frame, for the live status board
-pending_buy_meta = {} # symbol -> indicator snapshot at signal time, held until you approve/skip the buy
+    positions = {}          # symbol -> Pos
+    positions = {}
+    arms = {s: Arm() for s in SYMBOLS}
+
+    def slots_in_use():
+        return len(positions)
  
+    def names_open():
+        return "|".join(sorted(positions.keys()))
  
-class TerminalApproval:
-    """Plain-text sell approval, right here in this terminal (no popup window,
-    since this runs headless over SSH with no screen attached)."""
- 
-    @staticmethod
-    def _read_line_with_timeout(prompt, timeout_sec):
-        result_q = queue.Queue()
- 
-        def _reader():
-            try:
-                line = input(prompt)
-            except EOFError:
-                return
-            result_q.put(line)
- 
-        t = threading.Thread(target=_reader, daemon=True)
-        t.start()
-        try:
-            return result_q.get(timeout=timeout_sec)
-        except queue.Empty:
-            return None
- 
-    def run_forever(self):
-        while _RUNNING:
-            try:
-                symbol, price, ts, kind, reason = approval_queue.get(timeout=1)
-            except queue.Empty:
-                continue
- 
-            if kind == "BUY":
-                header = f"BUY SIGNAL -- {symbol} @ ~${price:.2f}"
-                ask = "Type Y and press Enter to BUY, or just press Enter to skip."
-            else:
-                header = f"SELL SIGNAL -- {symbol} @ ~${price:.2f}  ({reason})"
-                ask = "Type Y and press Enter to SELL, or just press Enter to keep holding."
- 
-            banner = (
-                f"\n{'='*60}\n{header}\n{'='*60}\n{ask}\n"
-                f"(you have {POPUP_TIMEOUT_SECONDS} seconds -- after that it auto-"
-                f"{'skips' if kind=='BUY' else 'expires (stays held)'})\n> "
-            )
- 
-            answer = self._read_line_with_timeout(banner, POPUP_TIMEOUT_SECONDS)
- 
-            if answer is None:
-                decision_queue.put((f"EXPIRED_{kind}", symbol, price, ts))
-                print(f"(no answer in time -- {symbol} {kind} EXPIRED)")
-                continue
- 
-            if answer.strip().lower() in ("y", "yes"):
-                decision_queue.put((f"APPROVE_{kind}", symbol, price, ts))
-            else:
-                decision_queue.put((f"SKIP_{kind}", symbol, price, ts))
- 
- 
-def slots_in_use():
-    return len(open_positions)
- 
- 
-def pair_leg_open(sym):
-    partner = PARTNER.get(sym)
-    return partner in open_positions
- 
- 
-def signal_worker(api):
-    """Watches every symbol, asks for your approval the instant the 2-part
-    signal fires -- black line's current angle is shallow enough, AND the
-    red line is rising 2 bars in a row, both true on the SAME bar
-    (2026-08-31, Gary's decision: RSI dropped entirely -- extensive
-    testing found it added no real predictive value, mostly just delay).
-    No arm-tracking or multi-bar alignment window needed now that there
-    are only two conditions to check, and they're required
-    simultaneously."""
-    last_signaled_bar = {s: None for s in SYMBOLS}
- 
-    log(f"Signal worker started. Black-line check: current angle must be shallower "
-        f"than {SHALLOWED:.1f} degrees. Red line rising 2 bars in a row. "
-        f"MAX_SLOTS={MAX_SLOTS}, pair-lock ON.")
+    def pair_leg_open(sym):
+        partner = PARTNER.get(sym)
+        return partner in positions
  
     while _RUNNING:
-        now_et = et_now()
-        if not in_session(now_et):
-            time.sleep(POLL_SECONDS)
+        now = et_now()
+        if not in_session(now):
+            log("Session closed. Sleeping.")
+            time.sleep(30)
             continue
  
+        # ---- EOD: flatten everything, per spec (session end closes) --------
+        if past(now, EOD_FLATTEN_ET):
+            for sym, pos in list(positions.items()):
+                try:
+                    api.market_sell(sym, pos.qty)
+                    log(f"EOD-FLAT {sym} qty={pos.qty}")
+                except Exception as e:
+                    log(f"EOD-FLAT-ERR {sym}: {e}")
+                positions.pop(sym, None)
+            log("EOD reached. Flat. Exiting loop.")
+            break
+ 
+        # ---- reconcile with the broker: did Gary sell by hand? -------------
+        # The engine cannot see Gary's manual sells directly. Each cycle we ask
+        # the broker what actually exists. If we think we hold a name but the
+        # broker shows it flat, Gary sold it -> drop it, free the slot, and
+        # reset its arm state so a FRESH 3-condition cluster is required before
+        # re-entering (no instant re-fire on stale conditions).
+        # Skipped in dry_run: the broker has no simulated positions, so syncing
+        # would wrongly wipe everything (the same trap rsiAlgo.py hit).
+        if not api.dry_run and positions:
+            try:
+                live_pos = api.list_positions()
+                for sym in list(positions.keys()):
+                    held_qty = live_pos.get(sym, {}).get("qty", 0)
+                    if held_qty <= 0:
+                        positions.pop(sym, None)
+                        arms[sym] = Arm()      # reset -> needs a fresh signal
+                        log(f"GARY-SOLD {sym} -- broker flat, engine was holding. "
+                            f"Slot freed, {sym} eligible to re-enter today.")
+            except Exception as e:
+                log(f"SYNC-WARN could not list positions: {e} "
+                    f"(keeping engine state as-is this cycle)")
+ 
+        allow_new = not past(now, NO_NEW_AFTER_ET)
+        board = []          # one row per symbol, printed at end of cycle
+ 
         for sym in SYMBOLS:
-            if sym in open_positions:
-                continue
             try:
                 df = api.get_bars(sym)
-                df = session_filter(df) if df is not None else None
-                if df is None or len(df) < WARMUP_BARS + ANGLE_LOOKBACK + 35:
-                    continue
-                fr = build_frame(df)
-                latest_frame[sym] = fr   # cache for the live status board
             except Exception as e:
-                log(f"WARN {sym}: {e}")
+                log(f"DATA-ERR {sym}: {e}")
+                board.append((sym, "DATA-ERR", ""))
+                continue
+            if df is not None:
+                df = session_filter(df)
+            if df is None or len(df) < WARMUP_BARS + ANGLE_LOOKBACK + 2:
+                board.append((sym, "warmup", ""))
                 continue
  
+            fr = build_frame(df)
+ 
+            # -------- manage an OPEN position: hard floor only --------------
+            if sym in positions:
+                pos = positions[sym]
+                if fr.low <= pos.floor:
+                    try:
+                        api.market_sell(sym, pos.qty)
+                    except Exception as e:
+                        log(f"FLOOR-SELL-ERR {sym}: {e}")
+                    log(f"FLOOR  {sym} low={fr.low:.2f} <= floor={pos.floor:.2f} "
+                        f"-- mechanical exit")
+                    positions.pop(sym, None)
+                    board.append((sym, "FLOOR-EXIT", ""))
+                else:
+                    pnl = (fr.close / pos.entry - 1) * 100 if pos.entry else 0.0
+                    board.append((sym, "HELD",
+                                  "in @ %.2f x%d  %+.1f%%  floor %.2f  (Gary sells)"
+                                  % (pos.entry, pos.qty, pnl, pos.floor)))
+                # Layer-1 suppression: no re-alert while open, and Gary sells
+                # by hand, so nothing else to do for a held name.
+                continue
+ 
+            # -------- 3-bar simultaneity clock (params #5/#6) ---------------
+            # Evaluate all three conditions on THIS bar and record when each was
+            # last true. Fire only when all three have occurred within a window
+            # of SIMUL_BARS (3) bars of one another. This replaces the old
+            # 15-bar arm latch; the conditions no longer need the exact same bar
+            # but must cluster inside 3 bars.
+            a = arms[sym]
+            i = fr.bar_index
+            c_rsi = arm_fires(fr)
+            c_black = black_gate_open(fr)
+            c_red = red_rising(fr)
+            if c_rsi:
+                a.last_rsi_cross = i
+            if c_black:
+                a.last_black = i
+            if c_red:
+                a.last_red = i
+ 
+            # ---- how close is this ticker to firing? (for the board) -------
+            # A condition counts as "live" if it fired within the last
+            # SIMUL_BARS bars. Show R/B/^ for rsi-cross / black-gate / red-rise.
+            def _live(last):
+                return last >= 0 and (i - last) <= (SIMUL_BARS - 1)
+            live_r = _live(a.last_rsi_cross)
+            live_b = _live(a.last_black)
+            live_e = _live(a.last_red)
+            n_live = sum((live_r, live_b, live_e))
+            flags = "%s%s%s" % ("R" if live_r else "-",
+                                "B" if live_b else "-",
+                                "^" if live_e else "-")
+            if n_live == 3:
+                state = "ARMED*"           # all three live -> should fire now
+            elif n_live == 2:
+                state = "ready"            # two of three within window
+            elif n_live == 1:
+                state = "watch"
+            else:
+                state = "flat"
+            detail = ("%s  rsi=%.1f ang=%.1f was=%.1f red=%.3f"
+                      % (flags, fr.rsi_now, fr.angle_now, fr.angle_was, fr.red_now))
+            board.append((sym, state, detail))
+ 
+            seen = (a.last_rsi_cross, a.last_black, a.last_red)
+            if -1 in seen:
+                continue                       # not all three have happened yet
+            if (max(seen) - min(seen)) > (SIMUL_BARS - 1):
+                continue                       # they did not cluster in 3 bars
+            if max(seen) != i:
+                continue                       # only fire on the completing bar
+ 
+            # all three conditions satisfied within a 3-bar window -> FIRE
             if fr.bar_index < WARMUP_BARS:
+                continue                       # earliest alert is bar 30
+            if not allow_new:
+                log(f"LATE-SKIP {sym} (no next bar in session)")
                 continue
- 
-            if not (black_gate_open(fr) and red_rising(fr)):
-                continue
- 
-            sig_key = (str(now_et.date()), fr.bar_index)
-            if last_signaled_bar[sym] == sig_key:
-                continue
-            last_signaled_bar[sym] = sig_key
- 
-            # ---- safety protections, ported from the plain system ----
             if slots_in_use() >= MAX_SLOTS:
                 log(f"SLOT-SKIP {sym} (slots full {MAX_SLOTS})")
                 continue
@@ -656,214 +531,84 @@ def signal_worker(api):
                 log(f"PAIR-SKIP {sym} (partner {PARTNER[sym]} already open)")
                 continue
  
-            log(f"SIGNAL {sym} @ {fr.close:.4f} bar={fr.bar_index} -- ASKING FOR YOUR APPROVAL "
-                f"(double-cyborg mode, {SHARES_PER_TRADE} share)")
-            pending_buy_meta[sym] = {
-                "entry_angle_now": fr.angle_now,
-                "entry_angle_was": fr.angle_was,
-            }
-            approval_queue.put((sym, fr.close, None, "BUY", "signal fired"))
+            # ---- capture slots/names AT THE MOMENT OF FIRE (spec 8) --------
+            slots_at_fire = slots_in_use()
+            names_at_fire = names_open()
+ 
+            # ---- size the order: ~$1000 notional at the current price ------
+            # fr.close is the last closed bar's price -- close enough to a
+            # market fill to size the order; the ACTUAL fill price (and
+            # therefore actual notional) is refined just below once the
+            # broker reports the average fill.
+            if fr.close <= 0:
+                log(f"BUY-ERR {sym}: non-positive price {fr.close}, not entering")
+                continue
+            qty = max(1, int(TRADE_NOTIONAL // fr.close))
+ 
+            # ---- AUTO enter: market buy ~$1000 notional ---------------------
+            fill = fr.close                    # provisional; refined below
+            try:
+                api.market_buy(sym, qty)
+                if not api.dry_run:
+                    time.sleep(1.5)
+                    live = api.list_positions()
+                    if sym in live and live[sym]["avg"] > 0:
+                        fill = live[sym]["avg"]
+                        if live[sym]["qty"] > 0:
+                            qty = live[sym]["qty"]   # true filled quantity
+            except Exception as e:
+                log(f"BUY-ERR {sym}: {e} -- not entering")
+                continue
+ 
+            floor = fill * (1 + HARD_FLOOR / 100.0)
+            positions[sym] = Pos(symbol=sym, entry=fill, floor=floor, qty=qty,
+                                 opened_ts=fr.ts)
+ 
+            log(f"FIRE   {sym} [{bar_et(fr.ts)}] bar {fr.bar_index} "
+                f"in @ {fill:.4f} x{qty} (~${fill * qty:,.0f}) floor {floor:.4f} "
+                f"rsi={fr.rsi_now:.1f} angle_now={fr.angle_now:.1f} "
+                f"angle_was={fr.angle_was:.1f} slots={slots_at_fire} "
+                f"target(disp)={DISPLAY_TARGET}%")
+ 
+            append_alert({
+                "time": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
+                "ticker": sym,
+                "price": f"{fill:.4f}",
+                "floor_price": f"{floor:.4f}",
+                "display_target": DISPLAY_TARGET,
+                "rsi": f"{fr.rsi_now:.2f}",
+                "angle_now": f"{fr.angle_now:.2f}",
+                "angle_was": f"{fr.angle_was:.2f}",
+                "slots_in_use": slots_at_fire,
+                "names_open": names_at_fire,
+                # took onward are Gary's to fill by hand:
+                "took": "", "fill": "", "sold_at": "",
+                "sold_time": "", "reason": "",
+            })
+ 
+        # ---- status board: who is armed / close to firing -----------------
+        # Order by how close each ticker is: ARMED* first, then ready, watch...
+        rank = {"ARMED*": 0, "ready": 1, "watch": 2, "HELD": 3, "flat": 4,
+                "warmup": 5, "DATA-ERR": 6, "FLOOR-EXIT": 0}
+        board.sort(key=lambda r: (rank.get(r[1], 9), r[0]))
+        et_hm = now.strftime("%H:%M")
+        log("---- BOARD %s ET  (flags R=rsi-cross B=black-gate ^=red-rising; "
+            "all 3 within %d bars = fire) ----" % (et_hm, SIMUL_BARS))
+        for sym, state, detail in board:
+            log("  %-5s %-8s %s" % (sym, state, detail))
+        n_armed = sum(1 for _, s, _ in board if s == "ARMED*")
+        n_ready = sum(1 for _, s, _ in board if s == "ready")
+        log("  slots %d/%d   armed=%d ready=%d   held=%s"
+            % (slots_in_use(), MAX_SLOTS, n_armed, n_ready,
+               names_open() or "none"))
  
         time.sleep(POLL_SECONDS)
  
+    log("Shutdown. Open positions (if any) left for manual handling:")
+    for sym, pos in positions.items():
+        log(f"  HELD {sym} entry={pos.entry:.2f} qty={pos.qty} floor={pos.floor:.2f}")
  
-STATUS_BOARD_SECONDS = 60   # how often the live status board prints
- 
- 
-def status_board_worker():
-    """Prints a one-line status board every minute showing what every
-    ticker is currently doing (black-line angle, red-line direction) --
-    same idea as the plain system's live board, added 2026-08-27 per Gary's
-    request so you can watch the angle move toward the threshold, even on
-    minutes where nothing fires."""
-    while _RUNNING:
-        time.sleep(STATUS_BOARD_SECONDS)
-        now_et = et_now()
-        if not in_session(now_et):
-            continue
-        if not latest_frame:
-            continue
- 
-        lines = []
-        for sym in SYMBOLS:
-            fr = latest_frame.get(sym)
-            if fr is None:
-                if sym in open_positions:
-                    lines.append(f"{sym}:HOLDING")
-                else:
-                    lines.append(f"{sym}:no data yet")
-                continue
-            red_dir = "up" if fr.red_now > fr.red_prev else "down"
-            held = " [HOLDING]" if sym in open_positions else ""
-            lines.append(
-                f"{sym}:angle={fr.angle_now:+5.1f}deg red={red_dir}{held}"
-            )
- 
-        log("--- status board ---")
-        # print 3 tickers per line so it stays readable in a normal terminal width
-        for i in range(0, len(lines), 3):
-            print("   " + "   |   ".join(lines[i:i + 3]), flush=True)
- 
- 
-def sell_monitor_worker(api):
-    """Watches every OPEN position, asks for sell approval the moment the
-    -2% stop or 2.5% trailing-stop condition is met, or it's end of day."""
-    last_sell_alert = {}
- 
-    while _RUNNING:
-        now_et = et_now()
-        if not in_session(now_et):
-            time.sleep(POLL_SECONDS)
-            continue
- 
-        for sym, pos in list(open_positions.items()):
-            try:
-                quote = api.get_latest_trade(sym)
-                price = quote.price
-            except Exception as e:
-                log(f"WARN could not get price for open position {sym}: {e}")
-                continue
- 
-            pos["peak"] = max(pos["peak"], price)
-            stop_price = pos["entry"] * (1 - STOP_PCT / 100)
-            trail_trigger = pos["peak"] * (1 - TRAIL_PCT / 100)
- 
-            reason = None
-            if price <= stop_price:
-                reason = f"stop-loss ({STOP_PCT:.0f}% below entry)"
-            elif pos["peak"] > pos["entry"] and price <= trail_trigger and trail_trigger > pos["entry"]:
-                reason = f"trailing stop ({TRAIL_PCT:.1f}% below peak of ${pos['peak']:.2f})"
-            elif past(now_et, EOD_FLATTEN_ET):
-                reason = "end of day -- market closing soon, time to flatten this position"
- 
-            if reason is None:
-                continue
- 
-            last_alert = last_sell_alert.get(sym, 0)
-            if time.time() - last_alert < SELL_ALERT_COOLDOWN_SECONDS:
-                continue
-            last_sell_alert[sym] = time.time()
- 
-            log(f"SELL CONDITION MET {sym} @ {price:.4f} -- {reason} -- awaiting your approval")
-            approval_queue.put((sym, price, None, "SELL", reason))
- 
-        time.sleep(POLL_SECONDS)
- 
- 
-def decision_worker(api):
-    """Waits for your typed answer, only THEN talks to TradeStation. Logs a
-    complete round-trip row to the CSV the moment a position actually closes.
-    DOUBLE-CYBORG (2026-08-30): now also waits for your approval on the BUY
-    side, not just the sell -- nothing is bought without you typing Y."""
-    while _RUNNING:
-        try:
-            action, symbol, price, ts = decision_queue.get(timeout=1)
-        except queue.Empty:
-            continue
- 
-        if action == "APPROVE_BUY":
-            log(f"APPROVED by you -- buying {symbol} @ ~{price:.4f}")
-            try:
-                result = api.market_buy(symbol, SHARES_PER_TRADE)
-                log(f"Buy order result for {symbol}: {result} ({SHARES_PER_TRADE} share @ ${price:.2f})")
-                meta = pending_buy_meta.pop(symbol, {})
-                open_positions[symbol] = {
-                    "entry": price, "peak": price, "qty": SHARES_PER_TRADE,
-                    "opened_ts": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
-                    "entry_angle_now": meta.get("entry_angle_now", ""),
-                    "entry_angle_was": meta.get("entry_angle_was", ""),
-                }
-                log(f"Now tracking open position: {symbol} entry=${price:.2f} -- "
-                    f"will alert on sell via this terminal")
-            except Exception as e:
-                log(f"ERROR buying {symbol}: {e}")
-                pending_buy_meta.pop(symbol, None)
-        elif action == "SKIP_BUY":
-            log(f"SKIPPED by you: {symbol} @ ~{price} -- not buying this signal")
-            pending_buy_meta.pop(symbol, None)
-        elif action == "EXPIRED_BUY":
-            log(f"Buy alert EXPIRED (no answer within {POPUP_TIMEOUT_SECONDS}s): {symbol} -- not buying")
-            pending_buy_meta.pop(symbol, None)
-        elif action == "APPROVE_SELL":
-            log(f"APPROVED by you -- selling {symbol} @ ~{price:.4f}")
-            pos = open_positions.get(symbol, {})
-            qty = pos.get("qty", SHARES_PER_TRADE)
-            try:
-                result = api.market_sell(symbol, qty)
-                log(f"Sell order result for {symbol}: {result}")
-                entry = pos.get("entry", price)
-                pnl_pct = (price / entry - 1) * 100 if entry else 0.0
-                append_trade_row({
-                    "time_opened": pos.get("opened_ts", ""),
-                    "time_closed": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
-                    "ticker": symbol, "entry": f"{entry:.4f}", "exit_price": f"{price:.4f}",
-                    "qty": qty, "pnl_pct": f"{pnl_pct:+.2f}", "reason": "approved sell",
-                    "angle_now_at_entry": pos.get("entry_angle_now", ""),
-                    "angle_was_at_entry": pos.get("entry_angle_was", ""),
-                })
-                open_positions.pop(symbol, None)
-            except Exception as e:
-                log(f"ERROR placing sell for {symbol}: {e}")
-        elif action == "SKIP_SELL":
-            log(f"SKIPPED sell by you: {symbol} @ ~{price} -- still holding, will ask again if condition persists")
-        elif action == "EXPIRED_SELL":
-            log(f"Sell alert EXPIRED (no answer within {POPUP_TIMEOUT_SECONDS}s): {symbol} -- still holding")
- 
- 
-def main():
-    _sig.signal(_sig.SIGINT, _stop)
-    _sig.signal(_sig.SIGTERM, _stop)
- 
-    api = TradeStationClient()
-    api._access_token()
-    acct = api.get_account()
-    ensure_csv()
- 
-    log(f"Connected to TradeStation account {acct.account_number} "
-        f"(status={acct.status}, env={api.env}, dry_run={api.dry_run})")
-    if api.dry_run:
-        log("DRY_RUN is ON -- approvals will be logged but NOT sent as real orders. "
-            "Set DRY_RUN=0 in .env once you're ready to trade live with this.")
- 
-    bal = api.get_balance()
-    log("=" * 70)
-    log("RSI MOD2 -- ENGINE B (Double Cyborg, self-contained file)")
-    log("=" * 70)
-    if bal:
-        log(f"BALANCE  equity=${bal['equity']:,.2f}  cash=${bal['cash']:,.2f}")
-        if api.env == "live" and not api.dry_run:
-            log("         ^ CHECK THIS ACCOUNT. Ctrl-C now if it is wrong.")
-    log(f"MODE     {RSI_MOD2_MODE}  |  SHALLOWED={SHALLOWED:.1f}  "
-        f"STOP_PCT={STOP_PCT:.1f}%  TRAIL_PCT={TRAIL_PCT:.1f}%  "
-        f"SHARES_PER_TRADE={SHARES_PER_TRADE}")
-    log(f"SUPPRESS per-ticker while open + global slots<={MAX_SLOTS} + same-pair lock")
-    log(f"UNIVERSE ({len(SYMBOLS)} tickers) {', '.join(SYMBOLS)}")
-    log(f"LOG      {LOG_CSV}")
-    if api.env == "live" and not api.dry_run:
-        log("*** LIVE TRADING ENABLED -- real orders will be sent ***")
-    log("=" * 70)
-    log("Watching quietly now -- will only print again when a real signal, "
-        "buy, sell, or heartbeat happens. This is normal; no news is good news.")
- 
-    ui = TerminalApproval()
- 
-    threading.Thread(target=ui.run_forever, daemon=True).start()
-    threading.Thread(target=signal_worker, args=(api,), daemon=True).start()
-    threading.Thread(target=sell_monitor_worker, args=(api,), daemon=True).start()
-    threading.Thread(target=decision_worker, args=(api,), daemon=True).start()
-    threading.Thread(target=status_board_worker, daemon=True).start()
- 
-    HEARTBEAT_SECONDS = 600
-    last_heartbeat = time.time()
-    while _RUNNING:
-        time.sleep(1)
-        if time.time() - last_heartbeat >= HEARTBEAT_SECONDS:
-            held = list(open_positions.keys())
-            log(f"(heartbeat) still watching {len(SYMBOLS)} tickers -- "
-                f"holding: {held if held else 'nothing right now'}")
-            last_heartbeat = time.time()
- 
- 
+
 if __name__ == "__main__":
+    WARMUP_BARS = WARMUP_BARS  # keep name in scope for clarity
     main()
- 
