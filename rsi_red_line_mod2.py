@@ -719,6 +719,66 @@ def status_board_worker():
             print("   " + "   |   ".join(lines[i:i + 3]), flush=True)
 
 
+RECONCILE_SECONDS = 10   # TIGHTENED (2026-09-03, Gary's decision): was 60
+                          # seconds, tightened down since a manually-sold
+                          # ticker being stuck even briefly isn't acceptable.
+                          # Checks the real account 6x more often now.
+
+
+def reconcile_positions_worker(api):
+    """NEW (2026-09-03, Gary's decision): periodically checks the REAL
+    broker account directly, and clears out anything this script thinks
+    it's still holding that's actually already gone -- specifically to
+    handle the case where Gary sells a position manually, directly in
+    TradeStation, outside this script entirely. Without this check, the
+    script would keep believing it still holds that ticker forever,
+    permanently blocking any new signal on it, and would try (and fail)
+    to sell something that no longer exists the moment a stop condition
+    is checked. This fixes both problems by keeping the script's own
+    memory honest against what's actually true in the account."""
+    while _RUNNING:
+        time.sleep(RECONCILE_SECONDS)
+        if not open_positions:
+            continue
+        try:
+            real_positions = api.list_positions()
+        except Exception as e:
+            log(f"WARN reconcile check failed: {e}")
+            continue
+
+        for sym in list(open_positions.keys()):
+            real = real_positions.get(sym)
+            if real is None or real.get("qty", 0) == 0:
+                pos = open_positions.pop(sym, None)
+                log(f"RECONCILE: {sym} is no longer held in the real account "
+                    f"(sold manually, outside this script) -- clearing it "
+                    f"from memory so it can trade again.")
+                if pos:
+                    try:
+                        quote = api.get_latest_trade(sym)
+                        exit_price = quote.price
+                    except Exception:
+                        exit_price = None
+                    entry = pos.get("entry", 0)
+                    if exit_price and entry:
+                        pnl_pct = (exit_price / entry - 1) * 100
+                        exit_str = f"{exit_price:.4f}"
+                        pnl_str = f"{pnl_pct:+.2f}"
+                    else:
+                        exit_str = "unknown (sold manually)"
+                        pnl_str = ""
+                    append_trade_row({
+                        "time_opened": pos.get("opened_ts", ""),
+                        "time_closed": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
+                        "ticker": sym, "entry": f"{entry:.4f}" if entry else "",
+                        "exit_price": exit_str,
+                        "qty": pos.get("qty", ""), "pnl_pct": pnl_str,
+                        "reason": "manual sell outside script (detected by reconcile check)",
+                        "angle_now_at_entry": pos.get("entry_angle_now", ""),
+                        "angle_was_at_entry": pos.get("entry_angle_was", ""),
+                    })
+
+
 def sell_monitor_worker(api):
     """Watches every OPEN position and sells automatically, with no
     approval needed, the moment any exit condition is met -- the -2%
@@ -859,6 +919,7 @@ def main():
     threading.Thread(target=ui.run_forever, daemon=True).start()
     threading.Thread(target=signal_worker, args=(api,), daemon=True).start()
     threading.Thread(target=sell_monitor_worker, args=(api,), daemon=True).start()
+    threading.Thread(target=reconcile_positions_worker, args=(api,), daemon=True).start()
     threading.Thread(target=decision_worker, args=(api,), daemon=True).start()
     threading.Thread(target=status_board_worker, daemon=True).start()
 
