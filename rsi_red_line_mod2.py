@@ -104,7 +104,11 @@ EMA_LEN        = 20        # black
 HMA_LEN        = 7         # red
 ANGLE_LOOKBACK = 5
 SHALLOWED      = -15.0
-WARMUP_BARS    = 30
+WARMUP_BARS    = 2   # REDUCED (2026-09-02, matching Engine B): the black
+                      # line and red line use a continuous, stitched
+                      # historical series already spanning back into the
+                      # prior session, so they're already valid right at
+                      # today's open -- no need to wait 30 fresh minutes.
 
 # ---- Cyborg exit rule (deliberately different from the plain system's
 # -5% hard-floor/manual-only exit) ----
@@ -116,10 +120,10 @@ POPUP_TIMEOUT_SECONDS = 600   # if you don't answer a sell prompt in this long,
 
 SHARES_PER_TRADE = 1   # fixed 1 share per trade (Gary's choice, 2026-08-26)
 
-MAX_SLOTS = 10   # same cap as the plain system -- ported over 2026-08-26,
-                 # this combined file was missing it before
+MAX_SLOTS = 50   # RAISED (2026-09-02, matching Engine B): high enough it
+                 # should never actually bind given the current ticker list.
 
-RSI_MOD2_MODE = "SINGLE_CYBORG"  # buy is automatic; only sell needs approval
+RSI_MOD2_MODE = "FULLY_AUTOMATIC"  # buy AND sell both automatic -- no approval for anything
 
 # Same PAIRS/SYMBOLS/PARTNER as the plain system, so both files always
 # watch the exact same tickers with the exact same pair-lock logic.
@@ -138,7 +142,13 @@ PAIRS = [
     ("IRE",  "IREZ"),
     ("SNXX", "SNDQ"),
     ("CWVX", "CORD"),
-    ("AAOX",),
+    ("ASTX", "ASTN"),
+    ("CBRX", "CBRZ"),
+    ("AAOX", "AAOZ"),
+    ("BEX",  "BEZ"),
+    ("LITX", "LITZ"),
+    ("MSTU", "MSTZ"),
+    ("IONX", "IONZ"),
 ]
 SYMBOLS = [s for pr in PAIRS for s in pr]
 PARTNER = {}
@@ -593,8 +603,10 @@ def slots_in_use():
 
 
 def pair_leg_open(sym):
-    partner = PARTNER.get(sym)
-    return partner in open_positions
+    # DISABLED (2026-09-02, matching Engine B): a real signal on one side
+    # of a pair is genuine information, not noise, even while holding
+    # the other side.
+    return False
 
 
 def signal_worker(api):
@@ -708,8 +720,12 @@ def status_board_worker():
 
 
 def sell_monitor_worker(api):
-    """Watches every OPEN position, asks for sell approval the moment the
-    -2% stop or 2.5% trailing-stop condition is met, or it's end of day."""
+    """Watches every OPEN position and sells automatically, with no
+    approval needed, the moment any exit condition is met -- the -2%
+    stop, the 2.5% trailing-stop, or end of day. CHANGED (2026-09-03,
+    Gary's decision): this file now has zero approval prompts anywhere,
+    for either buying or selling. Buying was already automatic by
+    design; every kind of sell is now automatic too."""
     last_sell_alert = {}
 
     while _RUNNING:
@@ -746,8 +762,24 @@ def sell_monitor_worker(api):
                 continue
             last_sell_alert[sym] = time.time()
 
-            log(f"SELL CONDITION MET {sym} @ {price:.4f} -- {reason} -- awaiting your approval")
-            approval_queue.put((sym, price, None, "SELL", reason))
+            log(f"AUTO-SELLING {sym} @ {price:.4f} -- {reason} (no approval needed)")
+            try:
+                qty = pos.get("qty", SHARES_PER_TRADE)
+                result = api.market_sell(sym, qty)
+                log(f"Sell order result for {sym}: {result}")
+                entry = pos.get("entry", price)
+                pnl_pct = (price / entry - 1) * 100 if entry else 0.0
+                append_trade_row({
+                    "time_opened": pos.get("opened_ts", ""),
+                    "time_closed": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
+                    "ticker": sym, "entry": f"{entry:.4f}", "exit_price": f"{price:.4f}",
+                    "qty": qty, "pnl_pct": f"{pnl_pct:+.2f}", "reason": reason,
+                    "angle_now_at_entry": pos.get("entry_angle_now", ""),
+                    "angle_was_at_entry": pos.get("entry_angle_was", ""),
+                })
+                open_positions.pop(sym, None)
+            except Exception as e:
+                log(f"ERROR auto-selling {sym}: {e}")
 
         time.sleep(POLL_SECONDS)
 
