@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 ============================================================
-  ENGINE A -- AUTO-BUY  (this is "SINGLE-CYBORG" mode)
-  Buy happens AUTOMATICALLY the instant a signal fires.
-  Sell always asks for your approval, right here in this
-  terminal (type Y and press Enter, or press Enter to hold).
+  ENGINE B -- DOUBLE CYBORG  (built 2026-08-30, updated 2026-08-31)
+  Neither buy NOR sell happens automatically. Every signal
+  asks for your approval right here in this terminal (type
+  Y and press Enter to act, or just press Enter to skip/hold).
 ============================================================
 
 ONE SELF-CONTAINED FILE. This does NOT import any other script --
@@ -29,9 +29,16 @@ SIGNAL (2-part rule, RSI removed 2026-08-31 -- Gary's decision):
     versions perform similarly -- the real benefit here is genuinely more
     candidates of comparable quality, not dramatically better ones, which
     is exactly what matters for a Cyborg design where you review every
-    candidate yourself.
+    candidate yourself before any money moves.
 
-ENTRY: automatic market buy the instant the signal fires. Size is a
+WHY DOUBLE CYBORG: since every candidate gets a human look before any
+    money moves, a false-positive signal here only costs you a glance
+    and a "no", not a real trade. That's a different risk profile from
+    Engine A (which buys the instant it fires, with no human check
+    first) -- more candidates of comparable quality is a genuine
+    advantage here in a way it wouldn't be for Engine A.
+
+ENTRY: asks for your approval the instant the signal fires. Size is a
     FIXED 1 SHARE per trade (Gary's choice, 2026-08-26) -- simple,
     minimal exposure while this new combined version is being trusted.
 
@@ -47,15 +54,16 @@ SAFETY PROTECTIONS (ported over from the plain system, 2026-08-26 --
     - Same-pair lock: won't buy NBIL if NBIZ is already open (and
       vice versa for every inverse pair), same as the plain system.
 
-BUG FIX (2026-08-26 evening, historical -- fixed in an earlier version,
-    no longer directly relevant since the "was steep" concept it was
-    protecting is gone entirely as of 2026-08-30):
+BUG FIX (2026-08-26 evening, THIS VERSION):
     Found by backtesting Aug 24/25 against real signals: the "black line
     was steep" check could reach back across a DIFFERENT trading day (even
-    a week+ earlier) and combine with today's real conditions, firing a
-    false signal. This entire mechanism (the historical "was steep"
-    lookback) was later removed altogether, so this specific bug class
-    can no longer occur.
+    a week+ earlier) and combine with today's real RSI/red-line conditions,
+    firing a false signal. Confirmed on SOXL, IRE, NBIZ, RKLX(8/25), CWVX,
+    and AAOX. Fixed two places (search "FIX (2026-08-26)" in this file):
+    every symbol's memory of these conditions is now wiped clean at the
+    start of each new trading day, and the steep-angle lookback can no
+    longer reach past today's own opening bar. This is the version to run
+    starting 2026-08-27.
 
 LOGGING: writes a complete round-trip row (entry + exit + reason) to
     its own CSV log the moment each trade actually closes -- a
@@ -65,7 +73,7 @@ LOGGING: writes a complete round-trip row (entry + exit + reason) to
 HOW TO RUN:
     cd ~/rsi_system
     set -a; source .env; set +a
-    ~/algotrend1v5/venv/bin/python3 rsi_mod2_A_autobuy.py
+    ~/algotrend1v5/venv/bin/python3 rsi_mod2_B_approvebuy.py
 
 Needs to run on a computer/server that stays on and connected during
 market hours.
@@ -104,11 +112,19 @@ EMA_LEN        = 20        # black
 HMA_LEN        = 7         # red
 ANGLE_LOOKBACK = 5
 SHALLOWED      = -15.0
-WARMUP_BARS    = 2   # REDUCED (2026-09-02, matching Engine B): the black
-                      # line and red line use a continuous, stitched
-                      # historical series already spanning back into the
-                      # prior session, so they're already valid right at
-                      # today's open -- no need to wait 30 fresh minutes.
+WARMUP_BARS    = 2   # REDUCED (2026-09-02, Gary's decision): used to wait 30
+                      # minutes into each day before checking for signals at
+                      # all. But the black line and red line are computed
+                      # from a continuous, stitched historical series that
+                      # already spans back into the prior session -- by the
+                      # moment today's market opens, they're already
+                      # mathematically valid, warmed up numbers, not needing
+                      # 30 fresh minutes of today specifically. Tested
+                      # earlier tonight: this value actually gave slightly
+                      # BETTER results than the 30-minute wait (81.7% reach
+                      # 1% vs 80.0%, +6.54% avg peak vs +6.55%), not just
+                      # equal. Set to 2, not 0, purely to avoid a harmless
+                      # edge case on the very first bar of the day.
 
 # ---- Cyborg exit rule (deliberately different from the plain system's
 # -5% hard-floor/manual-only exit) ----
@@ -120,10 +136,15 @@ POPUP_TIMEOUT_SECONDS = 600   # if you don't answer a sell prompt in this long,
 
 SHARES_PER_TRADE = 1   # fixed 1 share per trade (Gary's choice, 2026-08-26)
 
-MAX_SLOTS = 50   # RAISED (2026-09-02, matching Engine B): high enough it
-                 # should never actually bind given the current ticker list.
+MAX_SLOTS = 50   # RAISED (2026-09-02, Gary's decision): tomorrow's goal is
+                 # purely to verify the system catches every real signal --
+                 # a slot cap would silently hide a legitimate signal behind
+                 # "slots full," making it impossible to tell "missed" from
+                 # "correctly declined." 50 is high enough it should never
+                 # actually bind given the current ticker list. Bring a real
+                 # cap back once this moves from verification to real money.
 
-RSI_MOD2_MODE = "FULLY_AUTOMATIC"  # buy AND sell both automatic -- no approval for anything
+RSI_MOD2_MODE = "DOUBLE_CYBORG"  # both buy AND sell need your approval
 
 # Same PAIRS/SYMBOLS/PARTNER as the plain system, so both files always
 # watch the exact same tickers with the exact same pair-lock logic.
@@ -141,15 +162,17 @@ PAIRS = [
     ("NBIL", "NBIZ"),
     ("IRE",  "IREZ"),
     ("SNXX", "SNDQ"),
-    ("CWVX", "CORD"),
-    ("ASTX", "ASTN"),
-    ("CBRX", "CBRZ"),
-    ("AAOX", "AAOZ"),
-    ("BEX",  "BEZ"),
     ("LITX", "LITZ"),
-    ("MSTU", "MSTZ"),
     ("IONX", "IONZ"),
-]
+    ("BEX",  "BEZ"),
+    ("BMNU", "BMNZ"),
+    ("MSTU", "MSTZ"),
+    ("CRCG", "CRCD"),
+    ("SMCX", "SMCZ"),
+]  # FINAL LIST (2026-09-03, Gary's decision, after a full day of live
+   # testing plus careful review of volume, correlation, and news for
+   # every candidate). AAOX/AAOZ, ASTX/ASTN, CWVX/CORD, and CBRX/CBRZ
+   # all considered and set aside for this final cut.
 SYMBOLS = [s for pr in PAIRS for s in pr]
 PARTNER = {}
 for _grp in PAIRS:
@@ -170,7 +193,7 @@ EOD_FLATTEN_ET = "15:59"
 POLL_SECONDS = int(os.getenv("POLL_SECONDS") or 20)
 
 # Separate log file from the plain system's, so they never collide.
-LOG_CSV = os.getenv("MOD2_CYBORG_LOG") or "rsi_mod2_A_autobuy_log.csv"
+LOG_CSV = os.getenv("MOD2_CYBORG_LOG") or "rsi_mod2_B_approvebuy_log.csv"
 LOG_COLUMNS = [
     "time_opened", "time_closed", "ticker", "entry", "exit_price",
     "qty", "pnl_pct", "reason",
@@ -541,6 +564,7 @@ approval_queue = queue.Queue()
 decision_queue = queue.Queue()
 open_positions = {}   # symbol -> dict with entry/peak/qty/opened_ts/entry indicator snapshot
 latest_frame = {}     # symbol -> most recent Frame, for the live status board
+pending_buy_meta = {} # symbol -> indicator snapshot at signal time, held until you approve/skip the buy
 
 
 class TerminalApproval:
@@ -603,20 +627,23 @@ def slots_in_use():
 
 
 def pair_leg_open(sym):
-    # DISABLED (2026-09-02, matching Engine B): a real signal on one side
-    # of a pair is genuine information, not noise, even while holding
-    # the other side.
+    # DISABLED (2026-09-02, Gary's decision): tomorrow's goal is purely to
+    # verify the system catches every real signal. A real signal on one
+    # side of a pair is genuine, meaningful information even while holding
+    # the other side -- it shouldn't be silently hidden. Bring the real
+    # pair-lock back once this moves from verification to real money.
     return False
 
 
 def signal_worker(api):
-    """Watches every symbol, auto-buys the instant the 2-part signal fires --
-    black line's current angle is shallow enough, AND the red line is
-    rising 2 bars in a row, both true on the SAME bar (2026-08-31, Gary's
-    decision: RSI dropped entirely -- extensive testing found it added no
-    real predictive value, mostly just delay). No arm-tracking or
-    multi-bar alignment window needed now that there are only two
-    conditions to check, and they're required simultaneously."""
+    """Watches every symbol, asks for your approval the instant the 2-part
+    signal fires -- black line's current angle is shallow enough, AND the
+    red line is rising 2 bars in a row, both true on the SAME bar
+    (2026-08-31, Gary's decision: RSI dropped entirely -- extensive
+    testing found it added no real predictive value, mostly just delay).
+    No arm-tracking or multi-bar alignment window needed now that there
+    are only two conditions to check, and they're required
+    simultaneously."""
     last_signaled_bar = {s: None for s in SYMBOLS}
 
     log(f"Signal worker started. Black-line check: current angle must be shallower "
@@ -662,21 +689,13 @@ def signal_worker(api):
                 log(f"PAIR-SKIP {sym} (partner {PARTNER[sym]} already open)")
                 continue
 
-            log(f"SIGNAL {sym} @ {fr.close:.4f} bar={fr.bar_index} -- AUTO-BUYING "
-                f"(single-cyborg mode, {SHARES_PER_TRADE} share)")
-            try:
-                result = api.market_buy(sym, SHARES_PER_TRADE)
-                log(f"Buy order result for {sym}: {result} ({SHARES_PER_TRADE} share @ ${fr.close:.2f})")
-                open_positions[sym] = {
-                    "entry": fr.close, "peak": fr.close, "qty": SHARES_PER_TRADE,
-                    "opened_ts": now_et.strftime("%Y-%m-%d %H:%M:%S"),
-                    "entry_angle_now": fr.angle_now,
-                    "entry_angle_was": fr.angle_was,
-                }
-                log(f"Now tracking open position: {sym} entry=${fr.close:.2f} -- "
-                    f"will alert on sell via this terminal")
-            except Exception as e:
-                log(f"ERROR auto-buying {sym}: {e}")
+            log(f"SIGNAL {sym} @ {fr.close:.4f} bar={fr.bar_index} -- ASKING FOR YOUR APPROVAL "
+                f"(double-cyborg mode, {SHARES_PER_TRADE} share)")
+            pending_buy_meta[sym] = {
+                "entry_angle_now": fr.angle_now,
+                "entry_angle_was": fr.angle_was,
+            }
+            approval_queue.put((sym, fr.close, None, "BUY", "signal fired"))
 
         time.sleep(POLL_SECONDS)
 
@@ -719,73 +738,16 @@ def status_board_worker():
             print("   " + "   |   ".join(lines[i:i + 3]), flush=True)
 
 
-RECONCILE_SECONDS = 10   # TIGHTENED (2026-09-03, Gary's decision): was 60
-                          # seconds, tightened down since a manually-sold
-                          # ticker being stuck even briefly isn't acceptable.
-                          # Checks the real account 6x more often now.
-
-
-def reconcile_positions_worker(api):
-    """NEW (2026-09-03, Gary's decision): periodically checks the REAL
-    broker account directly, and clears out anything this script thinks
-    it's still holding that's actually already gone -- specifically to
-    handle the case where Gary sells a position manually, directly in
-    TradeStation, outside this script entirely. Without this check, the
-    script would keep believing it still holds that ticker forever,
-    permanently blocking any new signal on it, and would try (and fail)
-    to sell something that no longer exists the moment a stop condition
-    is checked. This fixes both problems by keeping the script's own
-    memory honest against what's actually true in the account."""
-    while _RUNNING:
-        time.sleep(RECONCILE_SECONDS)
-        if not open_positions:
-            continue
-        try:
-            real_positions = api.list_positions()
-        except Exception as e:
-            log(f"WARN reconcile check failed: {e}")
-            continue
-
-        for sym in list(open_positions.keys()):
-            real = real_positions.get(sym)
-            if real is None or real.get("qty", 0) == 0:
-                pos = open_positions.pop(sym, None)
-                log(f"RECONCILE: {sym} is no longer held in the real account "
-                    f"(sold manually, outside this script) -- clearing it "
-                    f"from memory so it can trade again.")
-                if pos:
-                    try:
-                        quote = api.get_latest_trade(sym)
-                        exit_price = quote.price
-                    except Exception:
-                        exit_price = None
-                    entry = pos.get("entry", 0)
-                    if exit_price and entry:
-                        pnl_pct = (exit_price / entry - 1) * 100
-                        exit_str = f"{exit_price:.4f}"
-                        pnl_str = f"{pnl_pct:+.2f}"
-                    else:
-                        exit_str = "unknown (sold manually)"
-                        pnl_str = ""
-                    append_trade_row({
-                        "time_opened": pos.get("opened_ts", ""),
-                        "time_closed": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
-                        "ticker": sym, "entry": f"{entry:.4f}" if entry else "",
-                        "exit_price": exit_str,
-                        "qty": pos.get("qty", ""), "pnl_pct": pnl_str,
-                        "reason": "manual sell outside script (detected by reconcile check)",
-                        "angle_now_at_entry": pos.get("entry_angle_now", ""),
-                        "angle_was_at_entry": pos.get("entry_angle_was", ""),
-                    })
-
-
 def sell_monitor_worker(api):
     """Watches every OPEN position and sells automatically, with no
-    approval needed, the moment any exit condition is met -- the -2%
+    approval needed, the moment ANY exit condition is met -- the -2%
     stop, the 2.5% trailing-stop, or end of day. CHANGED (2026-09-03,
-    Gary's decision): this file now has zero approval prompts anywhere,
-    for either buying or selling. Buying was already automatic by
-    design; every kind of sell is now automatic too."""
+    Gary's decision): end-of-day now auto-executes too, matching the
+    stops -- so nothing can slip past unnoticed into a bigger loss, or
+    an unwanted overnight hold, just because a prompt wasn't answered.
+    Buying still always asks for approval (see signal_worker) -- this
+    file's whole design is "you choose what to get into, but nothing
+    can get away from you once you're in.\""""
     last_sell_alert = {}
 
     while _RUNNING:
@@ -807,53 +769,90 @@ def sell_monitor_worker(api):
             trail_trigger = pos["peak"] * (1 - TRAIL_PCT / 100)
 
             reason = None
+            auto_execute = False
             if price <= stop_price:
                 reason = f"stop-loss ({STOP_PCT:.0f}% below entry)"
+                auto_execute = True
             elif pos["peak"] > pos["entry"] and price <= trail_trigger and trail_trigger > pos["entry"]:
                 reason = f"trailing stop ({TRAIL_PCT:.1f}% below peak of ${pos['peak']:.2f})"
+                auto_execute = True
             elif past(now_et, EOD_FLATTEN_ET):
                 reason = "end of day -- market closing soon, time to flatten this position"
+                auto_execute = True
 
             if reason is None:
                 continue
 
-            last_alert = last_sell_alert.get(sym, 0)
-            if time.time() - last_alert < SELL_ALERT_COOLDOWN_SECONDS:
+            # AUTO-EXECUTE (2026-09-03, Gary's decision): end-of-day now
+            # auto-executes too, alongside the hard stop and trailing stop --
+            # so that, as with those, nothing can slip past unnoticed into
+            # a bigger loss (or an unwanted overnight hold) just because a
+            # prompt wasn't answered in time. Buying still always asks for
+            # approval -- this file's whole design is "you choose what to
+            # get into, but nothing can get away from you once you're in."
+            if auto_execute:
+                last_alert = last_sell_alert.get(sym, 0)
+                if time.time() - last_alert < SELL_ALERT_COOLDOWN_SECONDS:
+                    continue
+                last_sell_alert[sym] = time.time()
+                log(f"AUTO-SELLING {sym} @ {price:.4f} -- {reason} (no approval needed, safety stop)")
+                try:
+                    qty = pos.get("qty", SHARES_PER_TRADE)
+                    result = api.market_sell(sym, qty)
+                    log(f"Sell order result for {sym}: {result}")
+                    entry = pos.get("entry", price)
+                    pnl_pct = (price / entry - 1) * 100 if entry else 0.0
+                    append_trade_row({
+                        "time_opened": pos.get("opened_ts", ""),
+                        "time_closed": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
+                        "ticker": sym, "entry": f"{entry:.4f}", "exit_price": f"{price:.4f}",
+                        "qty": qty, "pnl_pct": f"{pnl_pct:+.2f}", "reason": reason,
+                        "angle_now_at_entry": pos.get("entry_angle_now", ""),
+                        "angle_was_at_entry": pos.get("entry_angle_was", ""),
+                    })
+                    open_positions.pop(sym, None)
+                except Exception as e:
+                    log(f"ERROR auto-selling {sym}: {e}")
                 continue
-            last_sell_alert[sym] = time.time()
-
-            log(f"AUTO-SELLING {sym} @ {price:.4f} -- {reason} (no approval needed)")
-            try:
-                qty = pos.get("qty", SHARES_PER_TRADE)
-                result = api.market_sell(sym, qty)
-                log(f"Sell order result for {sym}: {result}")
-                entry = pos.get("entry", price)
-                pnl_pct = (price / entry - 1) * 100 if entry else 0.0
-                append_trade_row({
-                    "time_opened": pos.get("opened_ts", ""),
-                    "time_closed": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
-                    "ticker": sym, "entry": f"{entry:.4f}", "exit_price": f"{price:.4f}",
-                    "qty": qty, "pnl_pct": f"{pnl_pct:+.2f}", "reason": reason,
-                    "angle_now_at_entry": pos.get("entry_angle_now", ""),
-                    "angle_was_at_entry": pos.get("entry_angle_was", ""),
-                })
-                open_positions.pop(sym, None)
-            except Exception as e:
-                log(f"ERROR auto-selling {sym}: {e}")
 
         time.sleep(POLL_SECONDS)
 
 
 def decision_worker(api):
     """Waits for your typed answer, only THEN talks to TradeStation. Logs a
-    complete round-trip row to the CSV the moment a position actually closes."""
+    complete round-trip row to the CSV the moment a position actually closes.
+    DOUBLE-CYBORG (2026-08-30): now also waits for your approval on the BUY
+    side, not just the sell -- nothing is bought without you typing Y."""
     while _RUNNING:
         try:
             action, symbol, price, ts = decision_queue.get(timeout=1)
         except queue.Empty:
             continue
 
-        if action == "APPROVE_SELL":
+        if action == "APPROVE_BUY":
+            log(f"APPROVED by you -- buying {symbol} @ ~{price:.4f}")
+            try:
+                result = api.market_buy(symbol, SHARES_PER_TRADE)
+                log(f"Buy order result for {symbol}: {result} ({SHARES_PER_TRADE} share @ ${price:.2f})")
+                meta = pending_buy_meta.pop(symbol, {})
+                open_positions[symbol] = {
+                    "entry": price, "peak": price, "qty": SHARES_PER_TRADE,
+                    "opened_ts": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
+                    "entry_angle_now": meta.get("entry_angle_now", ""),
+                    "entry_angle_was": meta.get("entry_angle_was", ""),
+                }
+                log(f"Now tracking open position: {symbol} entry=${price:.2f} -- "
+                    f"will alert on sell via this terminal")
+            except Exception as e:
+                log(f"ERROR buying {symbol}: {e}")
+                pending_buy_meta.pop(symbol, None)
+        elif action == "SKIP_BUY":
+            log(f"SKIPPED by you: {symbol} @ ~{price} -- not buying this signal")
+            pending_buy_meta.pop(symbol, None)
+        elif action == "EXPIRED_BUY":
+            log(f"Buy alert EXPIRED (no answer within {POPUP_TIMEOUT_SECONDS}s): {symbol} -- not buying")
+            pending_buy_meta.pop(symbol, None)
+        elif action == "APPROVE_SELL":
             log(f"APPROVED by you -- selling {symbol} @ ~{price:.4f}")
             pos = open_positions.get(symbol, {})
             qty = pos.get("qty", SHARES_PER_TRADE)
@@ -896,7 +895,7 @@ def main():
 
     bal = api.get_balance()
     log("=" * 70)
-    log("RSI MOD2 -- ENGINE A (single, self-contained file)")
+    log("RSI MOD2 -- ENGINE B (Double Cyborg, self-contained file)")
     log("=" * 70)
     if bal:
         log(f"BALANCE  equity=${bal['equity']:,.2f}  cash=${bal['cash']:,.2f}")
@@ -919,7 +918,6 @@ def main():
     threading.Thread(target=ui.run_forever, daemon=True).start()
     threading.Thread(target=signal_worker, args=(api,), daemon=True).start()
     threading.Thread(target=sell_monitor_worker, args=(api,), daemon=True).start()
-    threading.Thread(target=reconcile_positions_worker, args=(api,), daemon=True).start()
     threading.Thread(target=decision_worker, args=(api,), daemon=True).start()
     threading.Thread(target=status_board_worker, daemon=True).start()
 
@@ -936,3 +934,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
