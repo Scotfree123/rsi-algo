@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 ============================================================
@@ -738,18 +739,69 @@ def status_board_worker():
             print("   " + "   |   ".join(lines[i:i + 3]), flush=True)
 
 
-def sell_monitor_worker(api):
-    """Watches every OPEN position and sells automatically, with no
-    approval needed, the moment ANY exit condition is met -- the -2%
-    stop, the 2.5% trailing-stop, or end of day. CHANGED (2026-09-03,
-    Gary's decision): end-of-day now auto-executes too, matching the
-    stops -- so nothing can slip past unnoticed into a bigger loss, or
-    an unwanted overnight hold, just because a prompt wasn't answered.
-    Buying still always asks for approval (see signal_worker) -- this
-    file's whole design is "you choose what to get into, but nothing
-    can get away from you once you're in.\""""
-    last_sell_alert = {}
+RECONCILE_SECONDS = 10   # how often to check the real account for manual sells
 
+
+def reconcile_positions_worker(api):
+    """ADDED (2026-09-03, Gary's decision): now that all selling is
+    manual, this check becomes essential -- periodically checks the
+    REAL broker account directly, and clears out anything this script
+    thinks it's still holding that's actually already gone (sold
+    manually by Gary, directly in TradeStation). Without this, a
+    manually-sold ticker would be permanently blocked from ever
+    trading again, since the script would keep believing it's still
+    held. Matches the same check already running in Engine A."""
+    while _RUNNING:
+        time.sleep(RECONCILE_SECONDS)
+        if not open_positions:
+            continue
+        try:
+            real_positions = api.list_positions()
+        except Exception as e:
+            log(f"WARN reconcile check failed: {e}")
+            continue
+
+        for sym in list(open_positions.keys()):
+            real = real_positions.get(sym)
+            if real is None or real.get("qty", 0) == 0:
+                pos = open_positions.pop(sym, None)
+                log(f"RECONCILE: {sym} is no longer held in the real account "
+                    f"(sold manually, outside this script) -- clearing it "
+                    f"from memory so it can trade again.")
+                if pos:
+                    try:
+                        quote = api.get_latest_trade(sym)
+                        exit_price = quote.price
+                    except Exception:
+                        exit_price = None
+                    entry = pos.get("entry", 0)
+                    if exit_price and entry:
+                        pnl_pct = (exit_price / entry - 1) * 100
+                        exit_str = f"{exit_price:.4f}"
+                        pnl_str = f"{pnl_pct:+.2f}"
+                    else:
+                        exit_str = "unknown (sold manually)"
+                        pnl_str = ""
+                    append_trade_row({
+                        "time_opened": pos.get("opened_ts", ""),
+                        "time_closed": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
+                        "ticker": sym, "entry": f"{entry:.4f}" if entry else "",
+                        "exit_price": exit_str,
+                        "qty": pos.get("qty", ""), "pnl_pct": pnl_str,
+                        "reason": "manual sell outside script (detected by reconcile check)",
+                        "angle_now_at_entry": pos.get("entry_angle_now", ""),
+                        "angle_was_at_entry": pos.get("entry_angle_was", ""),
+                    })
+
+
+def sell_monitor_worker(api):
+    """CHANGED (2026-09-03, Gary's decision): all automatic selling has
+    been removed -- no stop-loss, no trailing stop, no end-of-day
+    auto-flatten. Once a buy is approved, the position stays open
+    indefinitely, including overnight, until Gary sells it himself,
+    directly in TradeStation. This function now only tracks the peak
+    price reached, for the status board -- it never sells anything.
+    Nothing in this code will ever close a position."""
     while _RUNNING:
         now_et = et_now()
         if not in_session(now_et):
@@ -763,57 +815,7 @@ def sell_monitor_worker(api):
             except Exception as e:
                 log(f"WARN could not get price for open position {sym}: {e}")
                 continue
-
             pos["peak"] = max(pos["peak"], price)
-            stop_price = pos["entry"] * (1 - STOP_PCT / 100)
-            trail_trigger = pos["peak"] * (1 - TRAIL_PCT / 100)
-
-            reason = None
-            auto_execute = False
-            if price <= stop_price:
-                reason = f"stop-loss ({STOP_PCT:.0f}% below entry)"
-                auto_execute = True
-            elif pos["peak"] > pos["entry"] and price <= trail_trigger and trail_trigger > pos["entry"]:
-                reason = f"trailing stop ({TRAIL_PCT:.1f}% below peak of ${pos['peak']:.2f})"
-                auto_execute = True
-            elif past(now_et, EOD_FLATTEN_ET):
-                reason = "end of day -- market closing soon, time to flatten this position"
-                auto_execute = True
-
-            if reason is None:
-                continue
-
-            # AUTO-EXECUTE (2026-09-03, Gary's decision): end-of-day now
-            # auto-executes too, alongside the hard stop and trailing stop --
-            # so that, as with those, nothing can slip past unnoticed into
-            # a bigger loss (or an unwanted overnight hold) just because a
-            # prompt wasn't answered in time. Buying still always asks for
-            # approval -- this file's whole design is "you choose what to
-            # get into, but nothing can get away from you once you're in."
-            if auto_execute:
-                last_alert = last_sell_alert.get(sym, 0)
-                if time.time() - last_alert < SELL_ALERT_COOLDOWN_SECONDS:
-                    continue
-                last_sell_alert[sym] = time.time()
-                log(f"AUTO-SELLING {sym} @ {price:.4f} -- {reason} (no approval needed, safety stop)")
-                try:
-                    qty = pos.get("qty", SHARES_PER_TRADE)
-                    result = api.market_sell(sym, qty)
-                    log(f"Sell order result for {sym}: {result}")
-                    entry = pos.get("entry", price)
-                    pnl_pct = (price / entry - 1) * 100 if entry else 0.0
-                    append_trade_row({
-                        "time_opened": pos.get("opened_ts", ""),
-                        "time_closed": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
-                        "ticker": sym, "entry": f"{entry:.4f}", "exit_price": f"{price:.4f}",
-                        "qty": qty, "pnl_pct": f"{pnl_pct:+.2f}", "reason": reason,
-                        "angle_now_at_entry": pos.get("entry_angle_now", ""),
-                        "angle_was_at_entry": pos.get("entry_angle_was", ""),
-                    })
-                    open_positions.pop(sym, None)
-                except Exception as e:
-                    log(f"ERROR auto-selling {sym}: {e}")
-                continue
 
         time.sleep(POLL_SECONDS)
 
@@ -918,6 +920,7 @@ def main():
     threading.Thread(target=ui.run_forever, daemon=True).start()
     threading.Thread(target=signal_worker, args=(api,), daemon=True).start()
     threading.Thread(target=sell_monitor_worker, args=(api,), daemon=True).start()
+    threading.Thread(target=reconcile_positions_worker, args=(api,), daemon=True).start()
     threading.Thread(target=decision_worker, args=(api,), daemon=True).start()
     threading.Thread(target=status_board_worker, daemon=True).start()
 
@@ -934,4 +937,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
+  
