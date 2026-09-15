@@ -112,19 +112,20 @@ EMA_LEN        = 20        # black
 HMA_LEN        = 7         # red
 ANGLE_LOOKBACK = 5
 SHALLOWED      = -15.0
-WARMUP_BARS    = 2   # REDUCED (2026-09-02, Gary's decision): used to wait 30
-                      # minutes into each day before checking for signals at
-                      # all. But the black line and red line are computed
-                      # from a continuous, stitched historical series that
-                      # already spans back into the prior session -- by the
-                      # moment today's market opens, they're already
-                      # mathematically valid, warmed up numbers, not needing
-                      # 30 fresh minutes of today specifically. Tested
-                      # earlier tonight: this value actually gave slightly
-                      # BETTER results than the 30-minute wait (81.7% reach
-                      # 1% vs 80.0%, +6.54% avg peak vs +6.55%), not just
-                      # equal. Set to 2, not 0, purely to avoid a harmless
-                      # edge case on the very first bar of the day.
+WARMUP_BARS    = 12  # SET (2026-09-14, Gary's decision): after building the
+                      # daily-reset black/red calculation (see build_frame),
+                      # tested warmup lengths 6-25 minutes against the real
+                      # reach-1%-within-N-minutes measure across the full
+                      # ~3-month dataset. 6/8/10 min all produced identical
+                      # results (the math's first real signal never landed
+                      # before minute 12 anyway); 12 min was the actual
+                      # sweet spot, slightly beating even the shorter
+                      # warmups on most measures while giving the black
+                      # line meaningfully more time to mature past its
+                      # first few, still-forming minutes. 15+ min showed a
+                      # steady decline from there. Since this runs as
+                      # Double Cyborg (human approves every buy), more
+                      # candidate signals is a feature, not a cost.
 
 # ---- Cyborg exit rule (deliberately different from the plain system's
 # -5% hard-floor/manual-only exit) ----
@@ -136,7 +137,28 @@ POPUP_TIMEOUT_SECONDS = 180   # CHANGED (2026-09-03, Gary's decision): was 600
                               # buy prompt in this long,
                                # it auto-expires and keeps holding
 
-SHARES_PER_TRADE = 1   # fixed 1 share per trade (Gary's choice, 2026-08-26)
+TRADE_DOLLARS = 1   # TEMPORARY (2026-09-14, Gary's decision): this is a new,
+                        # not-yet-proven engine (daily-reset indicators,
+                        # WARMUP_BARS=12, MIN_BEND_PCT=2.0) going live for the
+                        # first time tomorrow. Gary wants to watch it react to
+                        # real market conditions without risking real money on
+                        # it yet. Setting this to $1 forces the "minimum 1
+                        # share" floor below to apply on every single trade,
+                        # regardless of the stock's price -- so every trade
+                        # will buy exactly 1 share. Once the engine has proven
+                        # itself running live for a while, raise this back up
+                        # (it was 1000 before this test).
+                        # Shares are computed at buy time: int(TRADE_DOLLARS /
+                        # current price), minimum 1 share.
+                        # Previously 1000 (set 2026-09-10), SHARES_PER_TRADE=1
+                        # (set 2026-08-26).
+
+
+def shares_for_dollars(price: float) -> int:
+    """How many whole shares $TRADE_DOLLARS buys at this price, min 1."""
+    if price is None or price <= 0:
+        return 1
+    return max(1, int(TRADE_DOLLARS / price))
 
 MAX_SLOTS = 50   # RAISED (2026-09-02, Gary's decision): tomorrow's goal is
                  # purely to verify the system catches every real signal --
@@ -468,15 +490,38 @@ class Frame:
 
 
 def build_frame(df: pd.DataFrame) -> Frame:
-    close = df["close"]
-    black = ema(close, EMA_LEN)
-    red = hma(close, HMA_LEN)
-    angle = black_angle(black)
-
     et_idx = df.index.tz_convert(ET)
     today = et_idx[-1].date()
     session_mask = (et_idx.date == today)
     bar_index = int(session_mask.sum()) - 1
+
+    # RESET DAILY (2026-09-14, Gary's decision -- reverting the 2026-09-02
+    # change): black/red/angle are now computed using ONLY today's bars,
+    # not the continuous multi-day stitched history. Backtesting found
+    # that chaining across the overnight gap meant the lines reacted to
+    # whatever gap-up/gap-down had already happened while the market was
+    # closed, and 92% of opening-window signals turned out to be riding a
+    # big overnight gap rather than catching real intraday movement (e.g.
+    # IONX 9/8: gapped +14% overnight, signal fired at the open on the
+    # gap-momentum, then gave back to a -10% loss by end of day). Gary's
+    # call: don't let something that happened while the market was closed
+    # get treated like it's happening right now. Tradeoff, confirmed
+    # deliberately accepted: the lines need to warm back up each morning,
+    # so WARMUP_BARS goes back up and the system can't fire for the first
+    # ~25 minutes of each session again (this is the dead zone the 9/02
+    # change was originally trying to avoid).
+    today_df = df[session_mask]
+    close = today_df["close"]
+    black = ema(close, EMA_LEN)
+    red = hma(close, HMA_LEN)
+    angle = black_angle(black)
+
+    def _safe(series, pos):
+        try:
+            v = series.iloc[pos]
+            return float(v) if not (isinstance(v, float) and math.isnan(v)) else float("nan")
+        except Exception:
+            return float("nan")
 
     # NOTE (2026-08-31, Gary's decision): RSI dropped from the signal
     # entirely. Extensive testing found essentially zero relationship
@@ -492,10 +537,10 @@ def build_frame(df: pd.DataFrame) -> Frame:
         close=float(close.iloc[-1]),
         open_=float(df["open"].iloc[-1]),
         low=float(df["low"].iloc[-1]),
-        red_now=float(red.iloc[-1]),
-        red_prev=float(red.iloc[-2]),
-        red_prev2=float(red.iloc[-3]),
-        angle_now=float(angle.iloc[-1]),
+        red_now=_safe(red, -1),
+        red_prev=_safe(red, -2),
+        red_prev2=_safe(red, -3),
+        angle_now=_safe(angle, -1),
         angle_was=float("nan"),
         bar_index=bar_index,
     )
@@ -515,14 +560,20 @@ def black_gate_open(fr: Frame) -> bool:
     return fr.angle_now > SHALLOWED
 
 
-MIN_BEND_PCT = 1.0   # ADDED (2026-09-03, Gary's decision): the old rule
-                     # accepted ANY positive rise, even a fraction of a
-                     # penny -- no minimum size at all. Real data showed
-                     # this fires on essentially every ticker, every single
-                     # day (686 signals across 687 ticker-days), including
-                     # tiny wiggles inside an already-established uptrend
-                     # that were never a real reversal in the first place.
-                     # Starting at 1% -- if this is still too many, raise it.
+MIN_BEND_PCT = 2.0   # REVISED (2026-09-14, Gary's final decision): this is
+                     # the Double Cyborg (human-approve) engine, so a lower
+                     # threshold generating more signals is fine -- Gary
+                     # doesn't have to take every one, he just wants more
+                     # to choose from. Backtested 1% vs 2% vs 3% on this
+                     # daily-reset/WARMUP_BARS=12 engine across the full
+                     # 73-day set: 3% gave 25 trades/68% hit-rate (7-day
+                     # sample), 2% gave 1,032 trades/57.1% hit-rate (full
+                     # set), 1% gave 5,527 trades/40.1% hit-rate (full set).
+                     # 2% was chosen as the middle ground: meaningfully more
+                     # signals than 3% without falling to 1%'s much weaker
+                     # quality.
+                     # Previously 3.0 (set 2026-09-10), 1.0 (set 2026-09-03),
+                     # briefly 8.0, then 5.0.
 
 
 def red_rising(fr: Frame) -> bool:
@@ -695,7 +746,8 @@ def signal_worker(api):
                 continue
 
             log(f"SIGNAL {sym} @ {fr.close:.4f} bar={fr.bar_index} -- ASKING FOR YOUR APPROVAL "
-                f"(double-cyborg mode, {SHARES_PER_TRADE} share)")
+                f"(double-cyborg mode, ~{shares_for_dollars(fr.close)} shares, "
+                f"~${TRADE_DOLLARS} notional)")
             pending_buy_meta[sym] = {
                 "entry_angle_now": fr.angle_now,
                 "entry_angle_was": fr.angle_was,
@@ -837,12 +889,13 @@ def decision_worker(api):
 
         if action == "APPROVE_BUY":
             log(f"APPROVED by you -- buying {symbol} @ ~{price:.4f}")
+            qty = shares_for_dollars(price)
             try:
-                result = api.market_buy(symbol, SHARES_PER_TRADE)
-                log(f"Buy order result for {symbol}: {result} ({SHARES_PER_TRADE} share @ ${price:.2f})")
+                result = api.market_buy(symbol, qty)
+                log(f"Buy order result for {symbol}: {result} ({qty} shares @ ${price:.2f})")
                 meta = pending_buy_meta.pop(symbol, {})
                 open_positions[symbol] = {
-                    "entry": price, "peak": price, "qty": SHARES_PER_TRADE,
+                    "entry": price, "peak": price, "qty": qty,
                     "opened_ts": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
                     "entry_angle_now": meta.get("entry_angle_now", ""),
                     "entry_angle_was": meta.get("entry_angle_was", ""),
@@ -861,7 +914,7 @@ def decision_worker(api):
         elif action == "APPROVE_SELL":
             log(f"APPROVED by you -- selling {symbol} @ ~{price:.4f}")
             pos = open_positions.get(symbol, {})
-            qty = pos.get("qty", SHARES_PER_TRADE)
+            qty = pos.get("qty", 1)
             try:
                 result = api.market_sell(symbol, qty)
                 log(f"Sell order result for {symbol}: {result}")
@@ -909,7 +962,7 @@ def main():
             log("         ^ CHECK THIS ACCOUNT. Ctrl-C now if it is wrong.")
     log(f"MODE     {RSI_MOD2_MODE}  |  SHALLOWED={SHALLOWED:.1f}  "
         f"STOP_PCT={STOP_PCT:.1f}%  TRAIL_PCT={TRAIL_PCT:.1f}%  "
-        f"SHARES_PER_TRADE={SHARES_PER_TRADE}")
+        f"TRADE_DOLLARS=${TRADE_DOLLARS}")
     log(f"SUPPRESS per-ticker while open + global slots<={MAX_SLOTS} + same-pair lock")
     log(f"UNIVERSE ({len(SYMBOLS)} tickers) {', '.join(SYMBOLS)}")
     log(f"LOG      {LOG_CSV}")
@@ -941,4 +994,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-  
