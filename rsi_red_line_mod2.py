@@ -3,9 +3,25 @@
 ============================================================
   ENGINE A -- AUTO-BUY  (this is "SINGLE-CYBORG" mode)
   Buy happens AUTOMATICALLY the instant a signal fires.
-  Sell always asks for your approval, right here in this
-  terminal (type Y and press Enter, or press Enter to hold).
+  Selling is entirely manual, done by Gary directly in
+  TradeStation -- this script only watches and reconciles.
 ============================================================
+
+CHANGED 2026-09-17 (Gary's decision, after a full day of testing):
+    ONE change from the version that was live before today: MIN_BEND_PCT
+    lowered from 2.0 to 1.75. Nothing else in the signal, exits, universe,
+    or safety protections changed. See the MIN_BEND_PCT constant below for
+    the exact reasoning and the numbers behind this specific choice.
+
+    Also confirmed today, NOT changed (documenting so this doesn't get
+    re-litigated by mistake later): a ticker is correctly NOT locked out
+    for the rest of the day once it trades. The only lockout is "while a
+    position is currently open" (see signal_worker's `if sym in
+    open_positions: continue`), released the moment that position closes,
+    whether by Gary's manual sell or by the reconcile check noticing it's
+    gone. Confirmed this is real, in the actual running code, not just in
+    a comment -- Gary specifically wants unlimited same-day re-entry and
+    this file already does that correctly.
 
 ONE SELF-CONTAINED FILE. This does NOT import any other script --
 everything it needs (TradeStation connection, indicators, signal
@@ -129,21 +145,18 @@ POPUP_TIMEOUT_SECONDS = 180   # CHANGED (2026-09-03, Gary's decision): was 600
                               # buy prompt in this long,
                                # it auto-expires and keeps holding
 
-TRADE_DOLLARS = 1   # TEMPORARY (2026-09-14, Gary's decision): this is a new,
-                        # not-yet-proven engine (daily-reset indicators,
-                        # WARMUP_BARS=12, MIN_BEND_PCT=2.0) going live for the
-                        # first time tomorrow. Gary wants to watch it react to
-                        # real market conditions without risking real money on
-                        # it yet. Setting this to $1 forces the "minimum 1
-                        # share" floor below to apply on every single trade,
-                        # regardless of the stock's price -- so every trade
-                        # will buy exactly 1 share. Once the engine has proven
-                        # itself running live for a while, raise this back up
-                        # (it was 1000 before this test).
+TRADE_DOLLARS = 500  # RAISED (2026-09-18, Gary's decision): moving up from the
+                        # $1/share test level now that this engine (daily-reset
+                        # indicators, WARMUP_BARS=12, MIN_BEND_PCT=1.75) is going
+                        # live for real. $500 notional per trade, same for every
+                        # ticker regardless of price.
                         # Shares are computed at buy time: int(TRADE_DOLLARS /
                         # current price), minimum 1 share.
-                        # Previously 1000 (set 2026-09-10), SHARES_PER_TRADE=1
-                        # (set 2026-08-26).
+                        # Previously 1 (set 2026-09-14, deliberately forced every
+                        # trade to exactly 1 share while watching this new engine
+                        # react to real market conditions before risking real
+                        # money-sized positions on it). Before that: 1000 (set
+                        # 2026-09-10), SHARES_PER_TRADE=1 (set 2026-08-26).
 
 
 def shares_for_dollars(price: float) -> int:
@@ -547,20 +560,49 @@ def black_gate_open(fr: Frame) -> bool:
     return fr.angle_now > SHALLOWED
 
 
-MIN_BEND_PCT = 2.0   # REVISED (2026-09-14, Gary's final decision): this is
-                     # the Double Cyborg (human-approve) engine, so a lower
-                     # threshold generating more signals is fine -- Gary
-                     # doesn't have to take every one, he just wants more
-                     # to choose from. Backtested 1% vs 2% vs 3% on this
-                     # daily-reset/WARMUP_BARS=12 engine across the full
-                     # 73-day set: 3% gave 25 trades/68% hit-rate (7-day
-                     # sample), 2% gave 1,032 trades/57.1% hit-rate (full
-                     # set), 1% gave 5,527 trades/40.1% hit-rate (full set).
-                     # 2% was chosen as the middle ground: meaningfully more
-                     # signals than 3% without falling to 1%'s much weaker
-                     # quality.
-                     # Previously 3.0 (set 2026-09-10), 1.0 (set 2026-09-03),
-                     # briefly 8.0, then 5.0.
+MIN_BEND_PCT = 1.75  # REVISED (2026-09-17, Gary's decision): nudged down from
+                     # 2.0, specifically to raise trade volume for single-
+                     # cyborg mode. Gary's stated goal: he wants roughly 20
+                     # trades/day total across the universe (not per ticker),
+                     # deliberately favoring more signals over stricter
+                     # quality -- his plan is to rely on watching each
+                     # position closely and exiting fast if it turns red,
+                     # rather than on the entry rule alone doing all the
+                     # work. Tested today (73-day backtest, proper re-entry
+                     # modeled -- a ticker frees up ~12 min after firing, not
+                     # locked for the rest of the day):
+                     #   2.00% bend: 1,016 trades (13.9/day), 56.7% reach
+                     #     +1% within 6 min, avg peak by 6 min +1.56%,
+                     #     avg worst dip in first minute -0.51%.
+                     #   1.75% bend: 1,486 trades (20.4/day), 52.9% reach
+                     #     +1% within 6 min, avg peak by 6 min +1.45%,
+                     #     avg worst dip in first minute -0.49%.
+                     # This lands almost exactly on Gary's 20/day target.
+                     # The cost is real but modest: win rate down under 4
+                     # points, downside per trade essentially unchanged --
+                     # nowhere near the much steeper falloff seen further
+                     # down (1.5% bend was already down to 49.8%/+1.34%
+                     # peak, and by 1.0% bend it had collapsed to 39.7%).
+                     # NOTE: "win rate" here means "did the price's HIGH
+                     # touch +1% above entry at any point in the first 6
+                     # minutes" -- not a full round-trip P&L measure, and
+                     # NOT the old "return if held exactly 12 minutes"
+                     # measure used before today (Gary flagged that measure
+                     # as meaningless for how he actually trades, since he
+                     # never plans to hold blind for a fixed time -- dropped
+                     # for good, replaced with this peak-by-minute view).
+                     # Previously 2.0 (set 2026-09-14), 3.0 (set 2026-09-10),
+                     # 1.0 (set 2026-09-03), briefly 8.0, then 5.0.
+                     #
+                     # STILL OPEN, NOT YET IN THIS FILE (tested today, not
+                     # backtested-and-decided enough to ship): a "regime"
+                     # filter requiring the red line to have recently broken
+                     # above a buffer envelope around the black line (Gary's
+                     # idea), and a red-line-angle-steepness filter (its own
+                     # actual slope in degrees, not just "ticked up or not").
+                     # Both showed real promise in isolation but need more
+                     # sweeping/validation before going live. Worth a
+                     # follow-up session.
 
 
 def red_rising(fr: Frame) -> bool:
@@ -933,6 +975,7 @@ def main():
         if api.env == "live" and not api.dry_run:
             log("         ^ CHECK THIS ACCOUNT. Ctrl-C now if it is wrong.")
     log(f"MODE     {RSI_MOD2_MODE}  |  SHALLOWED={SHALLOWED:.1f}  "
+        f"MIN_BEND_PCT={MIN_BEND_PCT:.2f}%  "
         f"STOP_PCT={STOP_PCT:.1f}%  TRAIL_PCT={TRAIL_PCT:.1f}%  "
         f"TRADE_DOLLARS=${TRADE_DOLLARS}")
     log(f"SUPPRESS per-ticker while open + global slots<={MAX_SLOTS} + same-pair lock")
