@@ -47,14 +47,23 @@ SIGNAL (2-part rule, RSI removed 2026-08-31 -- Gary's decision):
     is exactly what matters for a Cyborg design where you review every
     candidate yourself.
 
-ENTRY: automatic market buy the instant the signal fires. Size is a
-    FIXED 1 SHARE per trade (Gary's choice, 2026-08-26) -- simple,
-    minimal exposure while this new combined version is being trusted.
+ENTRY: automatic market buy the instant the signal fires. Size is
+    $500 notional per trade (TRADE_DOLLARS, raised 2026-09-18 from the
+    earlier fixed-1-share test level) -- shares = TRADE_DOLLARS / price,
+    minimum 1 share.
 
-EXIT: -2% hard stop, OR a 2.5% trailing-stop pullback from the peak
-    once in profit, OR end-of-day flatten -- but selling ALWAYS asks
-    for your approval first, right here in the terminal. This is
-    DELIBERATELY DIFFERENT from the plain system's -5% hard-floor/
+EXIT: RESTORED 2026-09-21 (Gary's decision), after finding that the
+    2026-09-03 removal (see sell_monitor_worker) left real positions
+    (e.g. BEZ, bought 9/18, still open Monday morning with zero
+    automatic protection) exposed with no safety net at all. All three
+    of the following now fire AUTOMATICALLY, with no approval prompt --
+    they're safety nets, not trading decisions, so waiting on a human
+    answer would defeat the purpose:
+      - -2% hard stop from entry (STOP_PCT)
+      - 2.5% trailing-stop pullback from the peak once in profit (TRAIL_PCT)
+      - end-of-day flatten at EOD_FLATTEN_ET (15:59 ET) -- sells everything
+        still open, once, near the close
+    This is DELIBERATELY DIFFERENT from the plain system's -5% hard-floor/
     manual-only exit -- that's the whole point of Cyborg mode.
 
 SAFETY PROTECTIONS (ported over from the plain system, 2026-08-26 --
@@ -120,6 +129,29 @@ EMA_LEN        = 20        # black
 HMA_LEN        = 7         # red
 ANGLE_LOOKBACK = 5
 SHALLOWED      = -15.0
+ATR_LEN        = 14   # ADDED (2026-09-21, Gary's decision, live mid-session):
+                       # Wilder-smoothed Average True Range, computed fresh
+                       # each day from real TradeStation minute bars (High/
+                       # Low/Close), same daily-reset pattern as black/red.
+                       # Used to make the bend requirement scale with each
+                       # ticker's OWN current volatility instead of one fixed
+                       # percentage for every ticker on every day -- Gary's
+                       # observation this morning: a calmer market than when
+                       # this was originally tuned means a fixed % bend is
+                       # either too strict (calm day) or too loose (volatile
+                       # day) depending on conditions, and it should instead
+                       # track actual volatility as it changes.
+                       # IMPORTANT CAVEAT: this could NOT be backtested
+                       # against history before going live, because the
+                       # downloaded 9/18 dataset used for prior backtests
+                       # only has closing prices, not real per-minute High/
+                       # Low bars, so no valid historical ATR could be
+                       # computed offline. The live TradeStation feed DOES
+                       # return real High/Low every bar (see get_bars), so
+                       # the math here is correct once running -- but today
+                       # is genuinely this mechanism's first real test,
+                       # not a backtested-and-confirmed change. Watch it
+                       # closely.
 WARMUP_BARS    = 12  # SET (2026-09-14, Gary's decision): after building the
                       # daily-reset black/red calculation (see build_frame),
                       # tested warmup lengths 6-25 minutes against the real
@@ -299,6 +331,21 @@ def black_angle(black: pd.Series) -> pd.Series:
 
     pct_per_bar = black.rolling(window_size).apply(_slope_pct_per_min, raw=True)
     return np.degrees(np.arctan(pct_per_bar))
+
+
+def atr_wilder_pct(high: pd.Series, low: pd.Series, close: pd.Series, n: int) -> pd.Series:
+    """Average True Range, Wilder-smoothed, expressed as a PERCENT of price
+    so it's directly comparable to bend_pct (which is also a percent of
+    price). True Range per bar = max(high-low, |high-prev_close|,
+    |low-prev_close|); ATR = Wilder EMA (alpha=1/n) of True Range."""
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / n, adjust=False).mean()
+    return (atr / close) * 100.0
 
 
 # ------------------------------------------------------------ session --------
@@ -499,9 +546,12 @@ class Frame:
     red_now: float
     red_prev: float
     red_prev2: float
+    red_prev3: float
+    red_prev4: float
     angle_now: float
     angle_was: float
     bar_index: int
+    atr_pct_now: float
 
 
 def build_frame(df: pd.DataFrame) -> Frame:
@@ -530,6 +580,7 @@ def build_frame(df: pd.DataFrame) -> Frame:
     black = ema(close, EMA_LEN)
     red = hma(close, HMA_LEN)
     angle = black_angle(black)
+    atr_pct = atr_wilder_pct(today_df["high"], today_df["low"], close, ATR_LEN)
 
     def _safe(series, pos):
         try:
@@ -555,9 +606,12 @@ def build_frame(df: pd.DataFrame) -> Frame:
         red_now=_safe(red, -1),
         red_prev=_safe(red, -2),
         red_prev2=_safe(red, -3),
+        red_prev3=_safe(red, -4),
+        red_prev4=_safe(red, -5),
         angle_now=_safe(angle, -1),
         angle_was=float("nan"),
         bar_index=bar_index,
+        atr_pct_now=_safe(atr_pct, -1),
     )
 
 
@@ -575,55 +629,58 @@ def black_gate_open(fr: Frame) -> bool:
     return fr.angle_now > SHALLOWED
 
 
-MIN_BEND_PCT = 1.75  # REVISED (2026-09-17, Gary's decision): nudged down from
-                     # 2.0, specifically to raise trade volume for single-
-                     # cyborg mode. Gary's stated goal: he wants roughly 20
-                     # trades/day total across the universe (not per ticker),
-                     # deliberately favoring more signals over stricter
-                     # quality -- his plan is to rely on watching each
-                     # position closely and exiting fast if it turns red,
-                     # rather than on the entry rule alone doing all the
-                     # work. Tested today (73-day backtest, proper re-entry
-                     # modeled -- a ticker frees up ~12 min after firing, not
-                     # locked for the rest of the day):
-                     #   2.00% bend: 1,016 trades (13.9/day), 56.7% reach
-                     #     +1% within 6 min, avg peak by 6 min +1.56%,
-                     #     avg worst dip in first minute -0.51%.
-                     #   1.75% bend: 1,486 trades (20.4/day), 52.9% reach
-                     #     +1% within 6 min, avg peak by 6 min +1.45%,
-                     #     avg worst dip in first minute -0.49%.
-                     # This lands almost exactly on Gary's 20/day target.
-                     # The cost is real but modest: win rate down under 4
-                     # points, downside per trade essentially unchanged --
-                     # nowhere near the much steeper falloff seen further
-                     # down (1.5% bend was already down to 49.8%/+1.34%
-                     # peak, and by 1.0% bend it had collapsed to 39.7%).
-                     # NOTE: "win rate" here means "did the price's HIGH
-                     # touch +1% above entry at any point in the first 6
-                     # minutes" -- not a full round-trip P&L measure, and
-                     # NOT the old "return if held exactly 12 minutes"
-                     # measure used before today (Gary flagged that measure
-                     # as meaningless for how he actually trades, since he
-                     # never plans to hold blind for a fixed time -- dropped
-                     # for good, replaced with this peak-by-minute view).
-                     # Previously 2.0 (set 2026-09-14), 3.0 (set 2026-09-10),
-                     # 1.0 (set 2026-09-03), briefly 8.0, then 5.0.
-                     #
-                     # STILL OPEN, NOT YET IN THIS FILE (tested today, not
-                     # backtested-and-decided enough to ship): a "regime"
-                     # filter requiring the red line to have recently broken
-                     # above a buffer envelope around the black line (Gary's
-                     # idea), and a red-line-angle-steepness filter (its own
-                     # actual slope in degrees, not just "ticked up or not").
-                     # Both showed real promise in isolation but need more
-                     # sweeping/validation before going live. Worth a
-                     # follow-up session.
+# ---- ATR-based bend (2026-09-21, tried live mid-session, then set aside
+# the same morning) -- kept here, unused, in case it's worth revisiting
+# properly backtested later. NOT wired into red_rising() below anymore. ----
+BEND_ATR_MULT = 5.5
+BEND_PCT_FLOOR = 0.5
+
+BEND_LOOKBACK_BARS = 3  # NARROWED from 4 to 3 (2026-09-21, Gary's final
+                        # decision, same morning): after seeing the full
+                        # 4-straight-bar requirement, Gary judged it would
+                        # cut out too many good signals -- "three greens in
+                        # a row with the red line bending up is sufficient."
+                        # Bend is now measured across BEND_LOOKBACK_BARS(3)
+                        # bars -- i.e. "did the red line rise on 3 straight
+                        # bars, moving at least MIN_BEND_PCT total over
+                        # those 3 minutes." Still requires EVERY bar in the
+                        # window to be rising (not just net higher at the
+                        # end) -- that sustained-trend requirement stays,
+                        # only the window length changed.
+                        # History: was 4 (tried a few minutes earlier, same
+                        # morning), before that an ATR-scaled version (tried
+                        # and set aside, same morning -- see BEND_ATR_MULT
+                        # above, still in the file but unused), before that
+                        # a flat 2-bar window (the original design).
+
+MIN_BEND_PCT = 1.00  # target for the 4-minute bend (Gary's own words: "one
+                     # percent within four minutes"). NOTE, an honest
+                     # caveat Gary raised himself: neither this number nor
+                     # the historical hit-rate stats in this file's older
+                     # comments were tested against TODAY's specific
+                     # volatility regime -- both this file's 73-day
+                     # backtest and the 9/18 single-day test were run
+                     # against whatever conditions existed on those past
+                     # days, calmer or wilder than today. Treat today as a
+                     # live test of this exact number, not a confirmed one.
 
 
 def red_rising(fr: Frame) -> bool:
-    if not (fr.red_now > fr.red_prev > fr.red_prev2):
+    """RELAXED (2026-09-21, Gary's final decision, same morning): dropped
+    the requirement that EVERY bar in the window be individually rising.
+    Now it's a 3-minute WINDOW to reach the target -- fire the moment the
+    red line is up at least MIN_BEND_PCT vs. 3 bars ago, as long as it's
+    still rising right now (not already turning over). Gary's own words:
+    "give it a window of three minutes to reach it... even if it only is
+    one or two or three greens" -- the move can arrive as one sharp step,
+    two, or a steady climb across all three; what matters is that 1% got
+    covered somewhere in that 3-minute window, not that every single
+    minute individually ticked up."""
+    if not (fr.red_now > fr.red_prev):
         return False
-    bend_pct = (fr.red_now - fr.red_prev2) / fr.close * 100
+    if math.isnan(fr.red_prev3):
+        return False
+    bend_pct = (fr.red_now - fr.red_prev3) / fr.close * 100
     return bend_pct >= MIN_BEND_PCT
 
 
@@ -904,16 +961,51 @@ def reconcile_positions_worker(api):
 
 
 def sell_monitor_worker(api):
-    """CHANGED (2026-09-03, Gary's decision): all automatic selling has
-    been removed entirely -- no stop-loss, no trailing stop, no
-    end-of-day auto-flatten. Only Gary selling manually, directly in
-    TradeStation, closes a position now. This function still tracks
-    each position's peak (for the status board) and still relies on
-    reconcile_positions_worker to notice and clean up manual sells --
-    but it no longer places any sell order itself, for any reason."""
+    """RESTORED (2026-09-21, Gary's decision): automatic selling is back --
+    -2% hard stop-loss (STOP_PCT), 2.5% trailing stop once in profit
+    (TRAIL_PCT), and an end-of-day flatten at EOD_FLATTEN_ET. All three
+    fire automatically, no approval prompt -- they're safety nets, not
+    trading decisions, so waiting on a human answer would defeat the
+    purpose. This reverses the 2026-09-03 change that removed all
+    automatic selling; that change left real positions (e.g. BEZ, bought
+    9/18) carried over into the next session with zero automatic
+    protection, which is what prompted restoring this."""
+    eod_done_today = None  # date EOD flatten last ran, so it only fires once/day
     while _RUNNING:
         now_et = et_now()
         if not in_session(now_et):
+            time.sleep(POLL_SECONDS)
+            continue
+
+        # ---- end-of-day flatten: sell everything still open, once ----
+        oh, om = _hhmm(EOD_FLATTEN_ET)
+        if (now_et.hour, now_et.minute) >= (oh, om) and eod_done_today != now_et.date():
+            for sym, pos in list(open_positions.items()):
+                qty = pos.get("qty", 1)
+                try:
+                    result = api.market_sell(sym, qty)
+                    log(f"EOD-FLATTEN {sym}: sell order result {result} ({qty} shares)")
+                except Exception as e:
+                    log(f"EOD-FLATTEN-ERR {sym}: {e}")
+                    continue
+                entry = pos.get("entry", 0)
+                try:
+                    quote = api.get_latest_trade(sym)
+                    exit_price = quote.price
+                except Exception:
+                    exit_price = entry
+                pnl_pct = (exit_price / entry - 1) * 100 if entry else 0.0
+                append_trade_row({
+                    "time_opened": pos.get("opened_ts", ""),
+                    "time_closed": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
+                    "ticker": sym, "entry": f"{entry:.4f}" if entry else "",
+                    "exit_price": f"{exit_price:.4f}",
+                    "qty": qty, "pnl_pct": f"{pnl_pct:+.2f}", "reason": "end-of-day flatten",
+                    "angle_now_at_entry": pos.get("entry_angle_now", ""),
+                    "angle_was_at_entry": pos.get("entry_angle_was", ""),
+                })
+                open_positions.pop(sym, None)
+            eod_done_today = now_et.date()
             time.sleep(POLL_SECONDS)
             continue
 
@@ -925,8 +1017,35 @@ def sell_monitor_worker(api):
                 log(f"WARN could not get price for open position {sym}: {e}")
                 continue
             pos["peak"] = max(pos["peak"], price)
-            # No sell conditions checked here anymore -- selling is
-            # entirely up to Gary now, done manually in TradeStation.
+            entry = pos.get("entry", price)
+            peak = pos["peak"]
+            qty = pos.get("qty", 1)
+
+            stop_hit = entry and price <= entry * (1 - STOP_PCT / 100)
+            trail_hit = peak > entry and price <= peak * (1 - TRAIL_PCT / 100)
+
+            if not (stop_hit or trail_hit):
+                continue
+
+            reason = "stop-loss" if stop_hit else "trailing-stop"
+            try:
+                result = api.market_sell(sym, qty)
+                log(f"{reason.upper()} {sym} @ {price:.4f} (entry {entry:.4f}, peak {peak:.4f}) "
+                    f"-- sell order result {result}")
+            except Exception as e:
+                log(f"{reason.upper()}-ERR {sym}: {e}")
+                continue
+            pnl_pct = (price / entry - 1) * 100 if entry else 0.0
+            append_trade_row({
+                "time_opened": pos.get("opened_ts", ""),
+                "time_closed": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
+                "ticker": sym, "entry": f"{entry:.4f}" if entry else "",
+                "exit_price": f"{price:.4f}",
+                "qty": qty, "pnl_pct": f"{pnl_pct:+.2f}", "reason": reason,
+                "angle_now_at_entry": pos.get("entry_angle_now", ""),
+                "angle_was_at_entry": pos.get("entry_angle_was", ""),
+            })
+            open_positions.pop(sym, None)
 
         time.sleep(POLL_SECONDS)
 
@@ -966,6 +1085,50 @@ def decision_worker(api):
             log(f"Sell alert EXPIRED (no answer within {POPUP_TIMEOUT_SECONDS}s): {symbol} -- still holding")
 
 
+def adopt_existing_positions(api):
+    """ADDED (2026-09-21, Gary's decision): at startup, pull in any REAL
+    positions already open in the broker account for symbols in our
+    universe (e.g. carried over from a previous session, like BEZ from
+    9/18) and adopt them into open_positions, so the automatic
+    stop-loss/trailing-stop/EOD-flatten protections apply to them too --
+    not just to positions this script opens itself. Without this, a
+    carryover position would sit invisible to this script forever, with
+    no automatic protection, until sold manually in TradeStation. This
+    means you do NOT need to manually liquidate carryover positions
+    before starting the engine -- it will pick them up the moment it
+    starts and apply the same -2% stop / 2.5% trailing-stop / EOD-flatten
+    rules to them as any position it opens itself. Entry price is taken
+    from the broker's own average price; entry-angle fields are left
+    blank since we don't know what the signal looked like when it was
+    actually bought (doesn't affect the exit logic, which only uses
+    entry/peak price)."""
+    try:
+        real_positions = api.list_positions()
+    except Exception as e:
+        log(f"WARN could not check for existing positions at startup: {e}")
+        return
+    now_et = et_now()
+    for sym, real in real_positions.items():
+        if sym not in SYMBOLS:
+            continue
+        qty = real.get("qty", 0)
+        if qty <= 0 or sym in open_positions:
+            continue
+        entry = real.get("avg", 0) or 0
+        try:
+            price_now = api.get_latest_trade(sym).price
+        except Exception:
+            price_now = entry
+        open_positions[sym] = {
+            "entry": entry, "peak": max(entry, price_now), "qty": qty,
+            "opened_ts": now_et.strftime("%Y-%m-%d %H:%M:%S") + " (adopted at startup)",
+            "entry_angle_now": "", "entry_angle_was": "",
+        }
+        log(f"ADOPTED existing position at startup: {sym} qty={qty} avg_entry={entry:.4f} "
+            f"current={price_now:.4f} -- now under automatic stop-loss/trailing-stop/"
+            f"EOD-flatten protection, same as any position this engine opens itself")
+
+
 def main():
     _sig.signal(_sig.SIGINT, _stop)
     _sig.signal(_sig.SIGTERM, _stop)
@@ -974,6 +1137,7 @@ def main():
     api._access_token()
     acct = api.get_account()
     ensure_csv()
+    adopt_existing_positions(api)
 
     log(f"Connected to TradeStation account {acct.account_number} "
         f"(status={acct.status}, env={api.env}, dry_run={api.dry_run})")
@@ -990,7 +1154,7 @@ def main():
         if api.env == "live" and not api.dry_run:
             log("         ^ CHECK THIS ACCOUNT. Ctrl-C now if it is wrong.")
     log(f"MODE     {RSI_MOD2_MODE}  |  SHALLOWED={SHALLOWED:.1f}  "
-        f"MIN_BEND_PCT={MIN_BEND_PCT:.2f}%  "
+        f"MIN_BEND_PCT={MIN_BEND_PCT:.2f}% over {BEND_LOOKBACK_BARS} bars  "
         f"STOP_PCT={STOP_PCT:.1f}%  TRAIL_PCT={TRAIL_PCT:.1f}%  "
         f"TRADE_DOLLARS=${TRADE_DOLLARS}")
     log(f"SUPPRESS per-ticker while open + global slots<={MAX_SLOTS} + same-pair lock")
@@ -1024,4 +1188,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-  
