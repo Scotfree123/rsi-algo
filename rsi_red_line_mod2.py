@@ -193,10 +193,25 @@ PAIRS = [
     ("MSTU", "MSTZ"),
     ("CRCG", "CRCD"),
     ("SMCX", "SMCZ"),
-]  # FINAL LIST (2026-09-03, Gary's decision, after a full day of live
-   # testing plus careful review of volume, correlation, and news for
-   # every candidate). AAOX/AAOZ, ASTX/ASTN, CWVX/CORD, and CBRX/CBRZ
-   # all considered and set aside for this final cut.
+    ("RKLX", "RKLZ"),   # ADDED (2026-09-18, Gary's decision): re-added after
+    ("ASTX", "ASTN"),   # being set aside on 2026-09-03 -- Gary spotted what
+    ("QBTX", "QBTZ"),   # looked like real, gradual Tandem-System-style moves
+    ("CWVX", "CORD"),   # on these names (RKLZ, OKLS, ASTN specifically) and
+    ("OKLL", "OKLS"),   # wants them back in Mod 3's universe to test live.
+                        # Same MIN_BEND_PCT=1.75 and TRADE_DOLLARS=500 as the
+                        # rest of the universe. NOTE (2026-09-18): checked
+                        # directly with Gary -- AAOX has NO real inverse
+                        # (AAOZ does not exist/trade); AAOX/AAOZ stays out.
+                        # !! VERIFY per the original spec's own warning:
+                        # confirm all 10 of these new symbols actually
+                        # resolve at TradeStation, and that each pair's two
+                        # legs are genuine inverses of the same underlying,
+                        # before trusting real fires on them.
+]  # ORIGINAL FINAL LIST was set 2026-09-03, after a full day of live
+   # testing plus careful review of volume, correlation, and news for every
+   # candidate; the 5 pairs above were part of that same original review
+   # ("considered and set aside for this final cut") and are only being
+   # added back now, 2026-09-18, on Gary's explicit decision above.
 SYMBOLS = [s for pr in PAIRS for s in pr]
 PARTNER = {}
 for _grp in PAIRS:
@@ -1009,3 +1024,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+  
