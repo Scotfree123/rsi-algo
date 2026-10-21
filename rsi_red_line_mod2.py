@@ -1,138 +1,58 @@
+
 #!/usr/bin/env python3
 """
 ============================================================
-  ENGINE B -- DOUBLE CYBORG  (built 2026-08-30, updated through
-  2026-09-21 evening -- signal rule now matches Engine A's final
-  window-based bend rule; this is its first live test)
-  Neither buy NOR sell happens automatically. Every signal
-  asks for your approval right here in this terminal (type
-  Y and press Enter to act, or just press Enter to skip/hold).
+  WINNING SIDE  --  ALERT ONLY  (built 2026-10-20, Gary's system)
+  NOTHING IS BOUGHT OR SOLD. This program places NO orders and needs no
+  trading account. It watches the 22 tickers, prints an alert when the
+  system says BUY, then keeps tracking that "paper" trade and prints an
+  EXIT alert when the system says get out. Every alert and every paper
+  trade is written to a CSV file so the results can be reviewed.
+  Because it never trades, it can run in a second terminal at the same
+  time as Engine B.
 ============================================================
 
-CHANGED 2026-10-18 (Gary's decision) -- THIS FILE: rsi_engineB_matchA_angle10.py
-    ONE change from rsi_engineB_matchA.py: ANGLE_LOOKBACK 5 -> 10. The black-line angle gate (angle must be
-    above -15 degrees) is now measured over the last 10 minutes (best-fit line through 11 points)
-    instead of the last 5 minutes (6 points). Reason: the 5-minute reading let buys through while the
-    black line had been falling hard for a long time (NBIL 2026-06-09, NBIZ 2026-08-03).
-    Everything else identical to rsi_engineB_matchA.py: 4 slots, $500, 1.00% rise over 3 bars, red below black,
-    stale-bar guard, pair lock, -2% stop, 2.5% trail, 22 tickers.
+THE SYSTEM (Gary's theory: "line cross, stay on the winning side of the black line")
 
-CHANGED 2026-10-15 (Gary's decision) -- THIS FILE: rsi_engineB_matchA.py
-  ENGINE B now uses the SAME signal rules, tickers, limit and size as Engine A
-  (rsi_engineA_4slots_belowblack.py). The only difference: BUYS ASK YOUR APPROVAL
-  here (type Y), where Engine A buys on its own. Sells: stop, trailing stop and
-  end-of-day are automatic, same as A.
-    - Signal: black angle above -15, red up and gaining >= 1.00% over 3 bars,
-      red BELOW black, stale-bar guard, 12-bar warmup. (RSI-dip requirement REMOVED.)
-    - MAX_SLOTS 4 (held + waiting-for-answer), $500 per trade, same-pair lock ON.
-    - 11 pairs (22 tickers), same list as Engine A.
-    - Difference kept on purpose: ONE PROMPT PER SIGNAL RUN. If you say no, it won't
-      ask again for that ticker until the signal has gone away and come back.
-      Engine A has no such rule (it buys, so there is nothing to re-ask).
-  NOTE: older comments below (RSI dip, 50 slots) are out of date.
+  BLACK line = EMA20 of the 1-minute closes.  RED line = HMA7.
+  Both are built from the first bar of the day, INCLUDING PRE-MARKET bars
+  (04:00 ET), so the lines are already formed at the 9:30 ET open.
 
-CHANGED 2026-10-08 (Gary's decision) -- "B2" EARLY HEADS-UP VERSION of Engine B.
-  Goal: the alert should come EARLIER in a bounce, so you can look at the
-  chart before the move is mostly over. Still asks for your approval on every
-  buy and every sell. Differences from the 9/21 Engine B:
-   1. Black-line gate loosened: angle must be above -15 (was above 0).
-   2. Red-line bend lowered: MIN_BEND_PCT 1.00% over 3 bars (was 1.25%).
-   3. RSI-DIP REQUIREMENT: RSI(7) must have been at or below RSI_DIP_LEVEL (30)
-      at some point in the last RSI_DIP_LOOKBACK_BARS (15) minutes, so the
-      looser bend only applies to recoveries from a dip.
-   4. ONE ALERT PER RUN: once an alert fires for a ticker it will not ask again
-      until the conditions have gone false and then true again (the old file
-      re-asked every minute).
-   5. STALE-BAR GUARD: ignores bars not from today or older than 4 minutes
-      (Engine B fired a false signal on 10/7 from yesterday's closing bars).
-   6. Own log file: rsi_mod2_B2_belowblack_log.csv.
-   7. BELOW-BLACK RULE (added 2026-10-13, Gary's decision): no alert while the red
-      line is at or above the black line. Alerts only fire with red BELOW black.
-  History test (35 tickers, 82 days): ~4 min earlier than the 9/21 rule, similar
-  hit rates, about the same number of alerts. Best-case peak measure, NOT a
-  realistic trade simulation.
+  BUY ALERT (checked on every finished 1-minute bar):
+    1. RED crosses UP through BLACK on this bar (red was at/below black, now above).
+    2. PRICE ANGLE >= CROSS_MIN_ANGLE (30 deg): best-fit line through the last 4 closes,
+       percent of price per minute, converted to degrees (arctan).
+       (Price, not the red line: red lags price and misses a jump at the open.)
+    3. BLACK LINE not falling: black angle over the last 10 minutes (11 points) > -15 deg.
+    4. At least 12 bars of today's data (pre-market bars count).
+    5. Bar is from today and no more than 4 minutes old.
+    6. Inside the alert window (default 09:30-10:00 ET = 6:30-7:00 AM Arizona).
+       This is where the history test showed an edge; later in the day it was break-even.
 
-ONE SELF-CONTAINED FILE. This does NOT import any other script --
-everything it needs (TradeStation connection, indicators, signal
-detection, the ticker list) lives right here, so there is nothing
-else to keep in sync and nothing else that needs to be "connected."
+  EXIT (first one that happens, checked on every finished bar after the buy):
+    a. STOP: close is 2.0% or more below the alert price.
+    b. RED TOUCHES BLACK: red closes below black.  (leaving the winning side)
+    c. SHARP PEAK: the red line's angle over its last 4 points is -35 deg or steeper.
+    d. End of day 15:59 ET.
+  A slight dip, or a flat top, that never touches black and never bends down sharply
+  is NOT an exit.
 
-SIGNAL (2-part rule, UPDATED 2026-09-21 evening -- Gary's decision,
-    after testing Engine A's rule against real 9/18 data one ticker at
-    a time):
-    Black line (EMA20)'s CURRENT angle is above SHALLOWED (now 0.0
-    degrees -- flat or rising, not declining at all right now) AND red
-    line (HMA7) is still rising right now AND has moved up at least
-    MIN_BEND_PCT (1.25%) net over the last BEND_LOOKBACK_BARS (3)
-    minutes -- a WINDOW to reach the target, not a requirement that
-    every single bar in it be individually rising. Both conditions
-    checked on the SAME bar. This replaces the earlier -15-degree/
-    ATR-scaled-bend version tested live mid-session on 2026-09-21 --
-    the ATR mechanism could not be validated offline (only closing
-    prices were available, not real intraday High/Low) and was
-    abandoned same-day in favor of directly testing against real
-    historical data. See SHALLOWED and MIN_BEND_PCT below for the
-    numbers and reasoning behind each choice. RSI was dropped earlier
-    (2026-08-31); extensive testing found essentially zero relationship
-    (correlation 0.064) between how "oversold" RSI got before a cross
-    and how well the trade performed afterward.
+  HISTORY (85 days, first 30 min, pre-market lines, no trading costs, exits at bar closes):
+    price angle >= 30: ~6 alerts/day, avg +0.34% per trade, win ~38%, held ~12 min
+    price angle >= 35: ~4.7 alerts/day, avg +0.48%
+    price angle >= 45: ~2.4 alerts/day, avg +0.79%
+    Whole day (not just the open): about break-even.  Small sample; costs not included.
 
-WHY DOUBLE CYBORG: since every candidate gets a human look before any
-    money moves, a false-positive signal here only costs you a glance
-    and a "no", not a real trade. That's a different risk profile from
-    Engine A (which buys the instant it fires, with no human check
-    first) -- more candidates of comparable quality is a genuine
-    advantage here in a way it wouldn't be for Engine A.
+IMPORTANT -- PRE-MARKET DATA:
+  This needs TradeStation to return pre-market 1-minute bars. The program asks for them
+  (sessiontemplate=USEQPreAndPost) and prints a CHECK line at startup saying how many
+  pre-market bars it received. If a ticker has fewer than MIN_PM_BARS pre-market bars
+  today, it is SKIPPED (logged once) so alerts never come from lines that were not built
+  the tested way. Look at the PREMARKET CHECK lines at startup.
 
-ENTRY: asks for your approval the instant the signal fires. Size is
-    $500 notional per trade (RAISED from a forced 1 share, 2026-09-21
-    night, Gary's decision -- one share wasn't enough real money on the
-    line to actually judge performance by), same per-trade size as
-    Engine A.
-
-EXIT: RESTORED 2026-09-21 (Gary's decision), after finding that the
-    2026-09-03 removal (see sell_monitor_worker) left real positions
-    exposed overnight with zero automatic protection. All three of the
-    following now fire AUTOMATICALLY, with NO approval prompt -- this is
-    the one exception to Double Cyborg's "everything asks first" rule,
-    because these are safety nets, not trading decisions, and waiting on
-    a human answer here would defeat the purpose:
-      - -2% hard stop from entry (STOP_PCT)
-      - 2.5% trailing-stop pullback from the peak once in profit (TRAIL_PCT)
-      - end-of-day flatten at EOD_FLATTEN_ET (15:59 ET) -- sells everything
-        still open, once, near the close
-    Buying still always asks for your approval first, right here in the
-    terminal -- only these three safety exits bypass that.
-
-SAFETY PROTECTIONS (ported over from the plain system, 2026-08-26 --
-    these were missing from earlier versions of this combined file):
-    - MAX_SLOTS = 10: won't open more than 10 positions at once.
-    - Same-pair lock: won't buy NBIL if NBIZ is already open (and
-      vice versa for every inverse pair), same as the plain system.
-
-BUG FIX (2026-08-26 evening, THIS VERSION):
-    Found by backtesting Aug 24/25 against real signals: the "black line
-    was steep" check could reach back across a DIFFERENT trading day (even
-    a week+ earlier) and combine with today's real RSI/red-line conditions,
-    firing a false signal. Confirmed on SOXL, IRE, NBIZ, RKLX(8/25), CWVX,
-    and AAOX. Fixed two places (search "FIX (2026-08-26)" in this file):
-    every symbol's memory of these conditions is now wiped clean at the
-    start of each new trading day, and the steep-angle lookback can no
-    longer reach past today's own opening bar. This is the version to run
-    starting 2026-08-27.
-
-LOGGING: writes a complete round-trip row (entry + exit + reason) to
-    its own CSV log the moment each trade actually closes -- a
-    separate file from the plain system's log, so the two never
-    collide or overwrite each other.
-
-HOW TO RUN:
-    cd ~/rsi_system
-    set -a; source .env; set +a
-    ~/algotrend1v5/venv/bin/python3 rsi_mod2_B_approvebuy.py
-
-Needs to run on a computer/server that stays on and connected during
-market hours.
+RUN:  set -a; source .env; set +a; ./venv/bin/python3 rsi_alert_winningside.py 2>&1 | tee winningside_$(date +%F).log
+Needs in .env: TS_CLIENT_ID, TS_CLIENT_SECRET, TS_REFRESH_TOKEN (and TS_ENV). No account id needed.
+Start it before 6:30 AM Arizona (9:30 ET); it can start any time after 4:00 AM ET.
 """
 import os
 import sys
@@ -140,9 +60,6 @@ import csv
 import time
 import math
 import signal as _sig
-import threading
-import queue
-from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -157,586 +74,39 @@ AZ = ZoneInfo("America/Phoenix")
 ET = ZoneInfo("America/New_York")
 
 TS_OAUTH_URL = "https://signin.tradestation.com/oauth/token"
-TS_BASE = {
-    "sim":  "https://sim-api.tradestation.com/v3",
-    "live": "https://api.tradestation.com/v3",
-}
+TS_BASE = {"sim": "https://sim-api.tradestation.com/v3",
+           "live": "https://api.tradestation.com/v3"}
 
-# ------------------------------------------------------------ constants ------
-
-EMA_LEN        = 20        # black
-HMA_LEN        = 7         # red
-ANGLE_LOOKBACK = 10   # CHANGED 2026-10-18 (Gary): black-line angle measured over 10 minutes (11 points), was 5.
-SHALLOWED      = -15.0  # B2 2026-10-08: loosened from 0.0 (see header). Older note: TIGHTENED (2026-09-21 evening, Gary's decision, from
-                       # -15.0): testing today's rule against real 9/18 data
-                       # found the -15-degree cutoff almost never actually
-                       # blocked anything -- the black line (a smoothed
-                       # 20-period average) rarely swings past about -10
-                       # degrees even during a real intraday decline, so the
-                       # filter wasn't doing meaningful work. Tightening all
-                       # the way to 0.0 (black line must be flat or rising,
-                       # not declining at all right now) tested clearly
-                       # better across all 20 tickers: win rate rose from
-                       # 32% to 41% and total simulated result improved from
-                       # +19.44% to +30.08%. Matches the update made to
-                       # Engine A the same evening.
-ATR_LEN        = 14   # ADDED (2026-09-21, Gary's decision, live mid-session,
-                       # matching Engine A), later SUPERSEDED same evening --
-                       # see BEND_LOOKBACK_BARS/MIN_BEND_PCT below. Kept here,
-                       # unused, in case real intraday High/Low data supports
-                       # a proper ATR-scaled backtest later; the downloaded
-                       # dataset used for tonight's testing only has closing
-                       # prices, not true OHLC bars.
-WARMUP_BARS    = 12  # SET (2026-09-14, Gary's decision): after building the
-                      # daily-reset black/red calculation (see build_frame),
-                      # tested warmup lengths 6-25 minutes against the real
-                      # reach-1%-within-N-minutes measure across the full
-                      # ~3-month dataset. 6/8/10 min all produced identical
-                      # results (the math's first real signal never landed
-                      # before minute 12 anyway); 12 min was the actual
-                      # sweet spot, slightly beating even the shorter
-                      # warmups on most measures while giving the black
-                      # line meaningfully more time to mature past its
-                      # first few, still-forming minutes. 15+ min showed a
-                      # steady decline from there. Since this runs as
-                      # Double Cyborg (human approves every buy), more
-                      # candidate signals is a feature, not a cost.
-
-# ---- Cyborg exit rule (deliberately different from the plain system's
-# -5% hard-floor/manual-only exit) ----
-STOP_PCT = 2.0
-TRAIL_PCT = 2.5
-SELL_ALERT_COOLDOWN_SECONDS = 90
-POPUP_TIMEOUT_SECONDS = 180   # CHANGED (2026-09-03, Gary's decision): was 600
-                              # (10 min), now 3 min -- if you don't answer a
-                              # buy prompt in this long,
-                               # it auto-expires and keeps holding
-
-TRADE_DOLLARS = 500  # CHANGED 2026-10-15 (Gary): $500 per trade on both engines. (Was 200.) Older note follows: CHANGED 2026-10-15 (Gary): $200 per trade, matches Engine A. Was 500; RAISED (2026-09-21 night, Gary's decision): was $1
-                     # (forcing 1 share/trade) for the very first live test
-                     # of this rewritten signal (0-degree angle filter,
-                     # 1.25% bend over 3 min). Gary's own reasoning: "I
-                     # can't really tell how well I do on trading unless
-                     # there's real money, and one share is enough to
-                     # tell" -- meaning 1 share doesn't put enough on the
-                     # line to actually judge performance by. $500 matches
-                     # Engine A's per-trade size, so both engines now risk
-                     # the same amount per trade.
-                     # Shares are computed at buy time: int(TRADE_DOLLARS /
-                     # current price), minimum 1 share.
-                     # History: $1 (2026-09-14, forced 1-share test), $1000
-                     # (2026-09-10), SHARES_PER_TRADE=1 (2026-08-26).
-
-
-def shares_for_dollars(price: float) -> int:
-    """How many whole shares $TRADE_DOLLARS buys at this price, min 1."""
-    if price is None or price <= 0:
-        return 1
-    return max(1, int(TRADE_DOLLARS / price))
-
-MAX_SLOTS = 4    # CHANGED 2026-10-15 (Gary): matches Engine A. Never more than 4 positions open
-                 # (positions held PLUS buys waiting for your answer count toward the 4).
-STALE_BAR_MINUTES = 4   # 2026-10-15: newest bar must be from today and no older than this many minutes
-
-RSI_LEN = 7                 # B2: RSI period (Wilder), computed from today's bars only
-RSI_DIP_LEVEL = 30.0        # B2: RSI must have been at or below this recently
-RSI_DIP_LOOKBACK_BARS = 15  # B2: ...within this many minutes (including now)
-
-RSI_MOD2_MODE = "DOUBLE_CYBORG"  # both buy AND sell need your approval
-
-# Same PAIRS/SYMBOLS/PARTNER as the plain system, so both files always
-# watch the exact same tickers with the exact same pair-lock logic.
-# UNIVERSE REDUCED (2026-09-02, Gary's decision): dropped from 19 down
-# to just the 9 highest-volatility tickers (5 pairs + AAOX). Two
-# independent reasons converged on this exact same cutoff: (1) this
-# was the natural volatility ranking cutoff identified much earlier in
-# this project (a clean gap between CWVX at 15.2% and IONZ at 14.5%),
-# and (2) tested tonight -- cutting to just these 9 roughly HALVES the
-# typical signal clustering (10.8 -> 5.5 tickers in any 10-min window)
-# and mathematically GUARANTEES the worst case can never exceed 9,
-# while trade quality is the same or slightly BETTER (avg peak
-# actually improved, from 6.55% to 7.27%, in the smaller group).
-PAIRS = [
-    ("NBIL", "NBIZ"),
-    ("IRE",  "IREZ"),
-    ("SNXX", "SNDQ"),
-    ("LITX", "LITZ"),
-    ("AAOX", "AAOZ"),
-    ("APLX", "APLZ"),
-    ("BEX",  "BEZ"),
-    ("SMCX", "SMCZ"),
-    ("RKLX", "RKLZ"),
-    ("ASTX", "ASTN"),
-    ("CWVX", "CORD"),
-]  # FINAL LIST (2026-09-03, Gary's decision, after a full day of live
-   # testing plus careful review of volume, correlation, and news for
-   # every candidate). AAOX/AAOZ, ASTX/ASTN, CWVX/CORD, and CBRX/CBRZ
-   # all considered and set aside for this final cut.
-SYMBOLS = [s for pr in PAIRS for s in pr]
-PARTNER = {}
-for _grp in PAIRS:
-    if len(_grp) == 2:
-        PARTNER[_grp[0]] = _grp[1]
-        PARTNER[_grp[1]] = _grp[0]
-
-_dupes = [s for s in set(SYMBOLS) if SYMBOLS.count(s) > 1]
-if _dupes:
-    raise SystemExit(f"FATAL: duplicate symbols in PAIRS: {sorted(_dupes)}")
-
-BAR_MINUTES = 1
-BAR_LOOKBACK = 400
-MARKET_OPEN_ET = "09:30"
-MARKET_CLOSE_ET = "16:00"
-NO_NEW_AFTER_ET = "15:58"
-EOD_FLATTEN_ET = "15:59"
+# ------------------------------------------------------------ settings -------
+EMA_LEN = 20                 # black
+HMA_LEN = 7                  # red
+ANGLE_LOOKBACK = 10          # black-line angle: 10 minutes (11 points)
+SHALLOWED = -15.0            # black angle must be above this
+CROSS_MIN_ANGLE = 30.0       # PRICE angle at the cross must be at least this (degrees)  <-- one number to change
+PRICE_ANGLE_POINTS = 4       # closes used for the price angle
+SHARP_EXIT_ANGLE = 35.0      # exit when the red line's angle is -35 deg or steeper
+RED_ANGLE_POINTS = 4         # points used for the red-line angle
+STOP_PCT = 2.0               # paper stop, % below the alert price
+WARMUP_BARS = 12
+STALE_BAR_MINUTES = 4
+MIN_PM_BARS = 10             # fewer pre-market bars than this today -> ticker skipped
+ALERT_START_ET = "09:30"
+ALERT_END_ET = "10:00"       # no NEW alerts after this (open paper trades are still tracked)
+EOD_ET = "15:59"
+CLOSE_ET = "16:00"
+HI_WINDOW_MIN = 8            # also record the highest price within this many minutes of the alert
+BAR_LOOKBACK = 700
 POLL_SECONDS = int(os.getenv("POLL_SECONDS") or 20)
-
-# Separate log file from the plain system's, so they never collide.
-LOG_CSV = os.getenv("MOD2_CYBORG_LOG") or "rsi_engineB_matchA_log.csv"
-LOG_COLUMNS = [
-    "time_opened", "time_closed", "ticker", "entry", "exit_price",
-    "qty", "pnl_pct", "reason",
-    "angle_now_at_entry", "angle_was_at_entry",
-]
-
-
-def log(msg):
-    ts = datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S AZ")
-    print(f"{ts} | {msg}", flush=True)
-
-
-def ensure_csv():
-    if not os.path.exists(LOG_CSV):
-        with open(LOG_CSV, "w", newline="") as f:
-            csv.writer(f).writerow(LOG_COLUMNS)
-
-
-def append_trade_row(row: dict):
-    with open(LOG_CSV, "a", newline="") as f:
-        csv.writer(f).writerow([row.get(c, "") for c in LOG_COLUMNS])
-
-
-# ------------------------------------------------------------ indicators -----
-
-def ema(s: pd.Series, n: int) -> pd.Series:
-    return s.ewm(span=n, adjust=False).mean()
-
-
-def wma(s: pd.Series, n: int) -> pd.Series:
-    w = np.arange(1, n + 1, dtype=float)
-    return s.rolling(n).apply(lambda x: np.dot(x, w) / w.sum(), raw=True)
-
-
-def hma(s: pd.Series, n: int) -> pd.Series:
-    half = 3
-    root = 3
-    return wma(2 * wma(s, half) - wma(s, n), root)
-
-
-def black_angle(black: pd.Series) -> pd.Series:
-    """Angle of the black line, in degrees. Uses a best-fit straight line
-    through the whole ANGLE_LOOKBACK-minute window (now 10 minutes, all 11 points), not
-    just the two endpoints -- validated 2026-08-30: this uses every
-    available data point instead of throwing most of them away, so it
-    can't be blind to a real move that happens to sit in the middle of
-    the window. Tested against the two-point method across the full
-    trade history: 72 trades vs 71, essentially identical -- this change
-    is safe, and is the more thorough of the two methods."""
-    window_size = ANGLE_LOOKBACK + 1
-    x = np.arange(window_size, dtype=float)
-    x_mean = x.mean()
-    x_centered = x - x_mean
-    denom = (x_centered ** 2).sum()
-
-    def _slope_pct_per_min(vals):
-        if np.isnan(vals).any():
-            return np.nan
-        y_mean = vals.mean()
-        slope = (x_centered * (vals - y_mean)).sum() / denom
-        if y_mean == 0:
-            return np.nan
-        return (slope / y_mean) * 100.0
-
-    pct_per_bar = black.rolling(window_size).apply(_slope_pct_per_min, raw=True)
-    return np.degrees(np.arctan(pct_per_bar))
-
-
-def atr_wilder_pct(high: pd.Series, low: pd.Series, close: pd.Series, n: int) -> pd.Series:
-    """Average True Range, Wilder-smoothed, expressed as a PERCENT of price
-    so it's directly comparable to bend_pct (which is also a percent of
-    price). True Range per bar = max(high-low, |high-prev_close|,
-    |low-prev_close|); ATR = Wilder EMA (alpha=1/n) of True Range."""
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1 / n, adjust=False).mean()
-    return (atr / close) * 100.0
-
-
-# ------------------------------------------------------------ session --------
-
-def session_filter(df):
-    if df is None or df.empty:
-        return df
-    et = df.tz_convert(ET)
-    try:
-        et = et.between_time(MARKET_OPEN_ET, MARKET_CLOSE_ET, inclusive="both")
-    except TypeError:
-        et = et.between_time(MARKET_OPEN_ET, MARKET_CLOSE_ET)
-    et = et[et.index.weekday < 5]
-    return et.tz_convert("UTC")
-
-
-def bar_et(ts):
-    try:
-        return pd.Timestamp(ts).tz_convert(ET).strftime("%H:%M")
-    except Exception:
-        return str(ts)
-
-
-def _to_utc_index(values):
-    out = []
-    for v in values:
-        t = pd.Timestamp(v)
-        out.append(t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC"))
-    return pd.DatetimeIndex(out)
-
-
-# ------------------------------------------------------------ TS client ------
-
-@dataclass
-class _Trade:
-    price: float
-
-
-@dataclass
-class _Account:
-    account_number: str
-    status: str
-
-
-class TradeStationClient:
-    def __init__(self):
-        self.client_id = (os.getenv("TS_CLIENT_ID") or os.getenv("TS_API_KEY")
-                          or os.getenv("TRADESTATION_CLIENT_ID"))
-        self.client_secret = (os.getenv("TS_CLIENT_SECRET") or os.getenv("TS_SECRET")
-                              or os.getenv("TRADESTATION_CLIENT_SECRET"))
-        self.refresh_token = (os.getenv("TS_REFRESH_TOKEN")
-                              or os.getenv("TRADESTATION_REFRESH_TOKEN"))
-        self.account_id = (os.getenv("TS_ACCOUNT_ID")
-                           or os.getenv("TRADESTATION_ACCOUNT_ID"))
-        self.env = (os.getenv("TS_ENV") or "sim").lower()
-        self.dry_run = (os.getenv("DRY_RUN") or "1") != "0"
-        self.drop_forming_bar = (os.getenv("DROP_FORMING_BAR") or "1") != "0"
-
-        if self.env not in TS_BASE:
-            raise SystemExit(f"TS_ENV must be 'sim' or 'live', got {self.env!r}")
-        self.base = TS_BASE[self.env]
-
-        missing = [k for k, v in {
-            "TS_CLIENT_ID (or TS_API_KEY)": self.client_id,
-            "TS_CLIENT_SECRET (or TS_SECRET)": self.client_secret,
-            "TS_REFRESH_TOKEN": self.refresh_token,
-            "TS_ACCOUNT_ID": self.account_id,
-        }.items() if not v]
-        if missing:
-            raise SystemExit(f"FATAL: missing TradeStation creds in .env: {missing}")
-
-        self._token = None
-        self._token_exp = 0.0
-        self._session = requests.Session()
-
-    def _access_token(self):
-        if self._token and time.time() < self._token_exp - 60:
-            return self._token
-        log("Refreshing TradeStation access token...")
-        r = self._session.post(TS_OAUTH_URL, data={
-            "grant_type": "refresh_token",
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "refresh_token": self.refresh_token,
-        }, timeout=15)
-        r.raise_for_status()
-        tok = r.json()
-        self._token = tok["access_token"]
-        self._token_exp = time.time() + int(tok.get("expires_in", 1200))
-        log(f"Token valid for {int(tok.get('expires_in', 1200))}s")
-        return self._token
-
-    def _headers(self):
-        return {"Authorization": f"Bearer {self._access_token()}"}
-
-    def _get(self, path, params=None):
-        r = self._session.get(self.base + path, headers=self._headers(),
-                              params=params, timeout=20)
-        r.raise_for_status()
-        return r.json()
-
-    def _post(self, path, body):
-        r = self._session.post(self.base + path, headers=self._headers(),
-                               json=body, timeout=20)
-        r.raise_for_status()
-        return r.json()
-
-    def get_bars(self, symbol, limit=None):
-        params = {"interval": BAR_MINUTES, "unit": "Minute",
-                  "barsback": limit or BAR_LOOKBACK}
-        data = self._get(f"/marketdata/barcharts/{symbol}", params)
-        bars = data.get("Bars", [])
-        if not bars:
-            return None
-        rows, raw_ts = [], []
-        for b in bars:
-            raw_ts.append(b["TimeStamp"])
-            rows.append({
-                "open": float(b["Open"]), "high": float(b["High"]),
-                "low": float(b["Low"]), "close": float(b["Close"]),
-                "volume": float(b.get("TotalVolume", 0) or 0),
-            })
-        df = pd.DataFrame(rows, index=_to_utc_index(raw_ts)).sort_index()
-        if self.drop_forming_bar and len(df) > 1:
-            df = df.iloc[:-1]
-        return df
-
-    def get_latest_trade(self, symbol):
-        data = self._get(f"/marketdata/quotes/{symbol}")
-        q = (data.get("Quotes") or [{}])[0]
-        last = q.get("Last") or q.get("Close") or 0.0
-        return _Trade(float(last))
-
-    def get_account(self):
-        data = self._get("/brokerage/accounts")
-        accts = data.get("Accounts", [])
-        me = next((a for a in accts if a.get("AccountID") == self.account_id), None)
-        if me is None and accts:
-            me = next((a for a in accts
-                       if str(a.get("AccountType", "")).lower() == "margin"), accts[0])
-            log(f"WARN TS_ACCOUNT_ID={self.account_id!r} not in env={self.env}; "
-                f"using {me.get('AccountID')} (type={me.get('AccountType')})")
-            self.account_id = me.get("AccountID")
-        me = me or {}
-        return _Account(me.get("AccountID", self.account_id),
-                        me.get("Status", "UNKNOWN"))
-
-    def get_balance(self):
-        try:
-            data = self._get(f"/brokerage/accounts/{self.account_id}/balances")
-            b = (data.get("Balances") or [{}])[0]
-            return {"equity": float(b.get("Equity", 0) or 0),
-                    "cash": float(b.get("CashBalance", 0) or 0),
-                    "buying_power": float(b.get("BuyingPower", 0) or 0)}
-        except Exception as e:
-            log(f"WARN could not read balances: {e}")
-            return None
-
-    def list_positions(self):
-        data = self._get(f"/brokerage/accounts/{self.account_id}/positions")
-        out = {}
-        for p in data.get("Positions", []):
-            out[p.get("Symbol")] = {
-                "qty": abs(int(float(p.get("Quantity", 0) or 0))),
-                "avg": float(p.get("AveragePrice", 0) or 0),
-            }
-        return out
-
-    def market_buy(self, symbol, qty):
-        body = {"AccountID": self.account_id, "Symbol": symbol,
-                "Quantity": str(int(qty)), "OrderType": "Market",
-                "TradeAction": "BUY", "TimeInForce": {"Duration": "DAY"},
-                "Route": "Intelligent"}
-        if self.dry_run:
-            log(f"DRY-RUN buy suppressed: BUY {qty} {symbol}")
-            return {"dry_run": True}
-        return self._post("/orderexecution/orders", body)
-
-    def market_sell(self, symbol, qty):
-        body = {"AccountID": self.account_id, "Symbol": symbol,
-                "Quantity": str(int(qty)), "OrderType": "Market",
-                "TradeAction": "SELL", "TimeInForce": {"Duration": "DAY"},
-                "Route": "Intelligent"}
-        if self.dry_run:
-            log(f"DRY-RUN sell suppressed: SELL {qty} {symbol}")
-            return {"dry_run": True}
-        return self._post("/orderexecution/orders", body)
-
-
-# ------------------------------------------------------------ signal ---------
-
-@dataclass
-class Frame:
-    ts: object
-    close: float
-    open_: float
-    low: float
-    red_now: float
-    red_prev: float
-    red_prev2: float
-    red_prev3: float
-    angle_now: float
-    angle_was: float
-    bar_index: int
-    atr_pct_now: float
-    rsi_min_recent: float = float("nan")   # B2: lowest RSI(7) over the last 15 min
-    black_now: float = float("nan")        # B2 below-black: black line (EMA20) value now
-
-
-def build_frame(df: pd.DataFrame) -> Frame:
-    et_idx = df.index.tz_convert(ET)
-    today = et_idx[-1].date()
-    session_mask = (et_idx.date == today)
-    bar_index = int(session_mask.sum()) - 1
-
-    # RESET DAILY (2026-09-14, Gary's decision -- reverting the 2026-09-02
-    # change): black/red/angle are now computed using ONLY today's bars,
-    # not the continuous multi-day stitched history. Backtesting found
-    # that chaining across the overnight gap meant the lines reacted to
-    # whatever gap-up/gap-down had already happened while the market was
-    # closed, and 92% of opening-window signals turned out to be riding a
-    # big overnight gap rather than catching real intraday movement (e.g.
-    # IONX 9/8: gapped +14% overnight, signal fired at the open on the
-    # gap-momentum, then gave back to a -10% loss by end of day). Gary's
-    # call: don't let something that happened while the market was closed
-    # get treated like it's happening right now. Tradeoff, confirmed
-    # deliberately accepted: the lines need to warm back up each morning,
-    # so WARMUP_BARS goes back up and the system can't fire for the first
-    # ~25 minutes of each session again (this is the dead zone the 9/02
-    # change was originally trying to avoid).
-    today_df = df[session_mask]
-    close = today_df["close"]
-    black = ema(close, EMA_LEN)
-    red = hma(close, HMA_LEN)
-    angle = black_angle(black)
-    atr_pct = atr_wilder_pct(today_df["high"], today_df["low"], close, ATR_LEN)
-    # B2: RSI(7), Wilder smoothing, from today's bars only
-    _d = close.diff()
-    _up = _d.clip(lower=0).ewm(alpha=1.0 / RSI_LEN, adjust=False).mean()
-    _dn = (-_d.clip(upper=0)).ewm(alpha=1.0 / RSI_LEN, adjust=False).mean()
-    rsi = 100 - 100 / (1 + _up / _dn.replace(0, np.nan))
-    rsi_min = rsi.rolling(RSI_DIP_LOOKBACK_BARS + 1, min_periods=1).min()
-
-    def _safe(series, pos):
-        try:
-            v = series.iloc[pos]
-            return float(v) if not (isinstance(v, float) and math.isnan(v)) else float("nan")
-        except Exception:
-            return float("nan")
-
-    # NOTE (2026-08-31, Gary's decision): RSI dropped from the signal
-    # entirely. Extensive testing found essentially zero relationship
-    # (correlation 0.064) between how "oversold" RSI got before a cross
-    # and how well the trade performed afterward -- the theory behind
-    # requiring it didn't hold up. The real, meaningful signal has always
-    # come from the black line and red line; RSI was mostly adding delay,
-    # not protection. Confirmed by construction: this simpler 2-part rule
-    # can never fire LATER than the old 3-part rule would have on the
-    # same day -- only ever at the same time or earlier.
-    return Frame(
-        ts=df.index[-1],
-        close=float(close.iloc[-1]),
-        open_=float(df["open"].iloc[-1]),
-        low=float(df["low"].iloc[-1]),
-        red_now=_safe(red, -1),
-        red_prev=_safe(red, -2),
-        red_prev2=_safe(red, -3),
-        red_prev3=_safe(red, -4),
-        angle_now=_safe(angle, -1),
-        angle_was=float("nan"),
-        bar_index=bar_index,
-        atr_pct_now=_safe(atr_pct, -1),
-        rsi_min_recent=_safe(rsi_min, -1),
-        black_now=_safe(black, -1),
-    )
-
-
-def black_gate_open(fr: Frame) -> bool:
-    """TIGHTENED (2026-09-21 evening, Gary's decision): this checks the
-    black line's CURRENT angle -- if it's flat or rising (angle above
-    SHALLOWED, now 0.0 degrees), the trade is allowed through. Previously
-    allowed some real decline through (SHALLOWED=-15), but testing found
-    that threshold was almost never actually reached even during a real
-    intraday slide -- the black line is a smoothed 20-period average, so
-    its 5-minute slope rarely swings past about -10 degrees regardless.
-    Requiring flat-or-rising (0.0) instead of "not too steep down"
-    tested clearly better on real data. Matches Engine A."""
-    if math.isnan(fr.angle_now):
-        return False
-    return fr.angle_now > SHALLOWED
-
-
-BEND_LOOKBACK_BARS = 3  # window (in minutes/bars) the red line has to reach
-                        # MIN_BEND_PCT within. Matches Engine A.
-
-MIN_BEND_PCT = 1.00  # B2 2026-10-08: lowered from 1.25. Older note: REPLACED BEND_ATR_MULT/ATR-scaled bend (2026-09-21
-                     # evening, Gary's decision): the ATR mechanism could
-                     # not be validated offline (the downloaded dataset only
-                     # has closing prices, not real intraday High/Low, so no
-                     # honest historical ATR test was possible) and was
-                     # abandoned the same day in favor of testing directly
-                     # against real 9/18 minute data with a flat bend
-                     # percentage instead. Tested 1.00% through 3.00% with
-                     # the black line held flat-or-rising: 1.00% produced a
-                     # lot of volume (65 trades/day across 20 tickers, ~10/
-                     # hour -- too many to review one at a time as Double
-                     # Cyborg). 1.25% cuts that down to 38 trades/day
-                     # (~5.8/hour) while keeping a similar per-trade result
-                     # to 1.00%, and Gary chose it specifically because this
-                     # is Engine B's first live test and he wants a
-                     # manageable number of prompts to review, not
-                     # necessarily the single best-testing number (1.50%
-                     # tested slightly better per-trade but let through
-                     # even fewer candidates). Since Gary reviews and can
-                     # decline any signal himself, a somewhat looser
-                     # threshold here is fine -- his own judgment is the
-                     # real second filter Engine A doesn't have. Position
-                     # size is fixed at 1 share (see TRADE_DOLLARS) for this
-                     # first run, independent of this threshold.
-                     #
-                     # ATR_LEN/atr_wilder_pct() left in the file, unused,
-                     # for a future backtest once real intraday High/Low
-                     # data is available.
-
-
-def red_rising(fr: Frame) -> bool:
-    """WINDOW rule (2026-09-21 evening, Gary's decision, matching Engine
-    A): not "every bar in the window must be individually rising" --
-    just needs to still be rising right now, and to have covered at
-    least MIN_BEND_PCT net over the last BEND_LOOKBACK_BARS(3) minutes.
-    Gary's own words (from tuning Engine A the same day): "give it a
-    window of three minutes to reach it... even if it only is one or two
-    or three greens.\""""
-    if not (fr.red_now > fr.red_prev):
-        return False
-    if math.isnan(fr.red_prev3):
-        return False
-    bend_pct = (fr.red_now - fr.red_prev3) / fr.close * 100
-    return bend_pct >= MIN_BEND_PCT
-
-
-def et_now():
-    return datetime.now(ET)
-
-
-def _hhmm(s):
-    hh, mm = s.split(":")
-    return int(hh), int(mm)
-
-
-def in_session(now_et):
-    oh, om = _hhmm(MARKET_OPEN_ET)
-    ch, cm = _hhmm(MARKET_CLOSE_ET)
-    o = now_et.replace(hour=oh, minute=om, second=0, microsecond=0)
-    c = now_et.replace(hour=ch, minute=cm, second=0, microsecond=0)
-    return o <= now_et <= c and now_et.weekday() < 5
-
-
-def past(now_et, hhmm_str):
-    hh, mm = _hhmm(hhmm_str)
-    mark = now_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    return now_et >= mark
-
+SESSION_TEMPLATE = "USEQPreAndPost"
+LOG_CSV = os.getenv("WINNINGSIDE_LOG") or "winningside_log.csv"
+LOG_COLUMNS = ["date", "ticker", "alert_time_az", "alert_price", "price_angle", "black_angle",
+               "exit_time_az", "exit_price", "pnl_pct", "exit_reason", "minutes_held",
+               "high_within_8min_pct", "high_before_exit_pct"]
+
+PAIRS = [("NBIL", "NBIZ"), ("IRE", "IREZ"), ("SNXX", "SNDQ"), ("LITX", "LITZ"),
+         ("AAOX", "AAOZ"), ("APLX", "APLZ"), ("BEX", "BEZ"), ("SMCX", "SMCZ"),
+         ("RKLX", "RKLZ"), ("ASTX", "ASTN"), ("CWVX", "CORD")]
+SYMBOLS = [s for pr in PAIRS for s in pr]
 
 _RUNNING = True
 
@@ -746,477 +116,308 @@ def _stop(*_):
     _RUNNING = False
 
 
-# ------------------------------------------------------------ Cyborg UI ------
-
-approval_queue = queue.Queue()
-decision_queue = queue.Queue()
-open_positions = {}   # symbol -> dict with entry/peak/qty/opened_ts/entry indicator snapshot
-latest_frame = {}     # symbol -> most recent Frame, for the live status board
-pending_buy_meta = {} # symbol -> indicator snapshot at signal time, held until you approve/skip the buy
+_sig.signal(_sig.SIGINT, _stop)
+_sig.signal(_sig.SIGTERM, _stop)
 
 
-class TerminalApproval:
-    """Plain-text sell approval, right here in this terminal (no popup window,
-    since this runs headless over SSH with no screen attached)."""
+def log(msg):
+    print(f"{datetime.now(AZ).strftime('%Y-%m-%d %H:%M:%S AZ')} | {msg}", flush=True)
 
-    @staticmethod
-    def _read_line_with_timeout(prompt, timeout_sec):
-        result_q = queue.Queue()
 
-        def _reader():
-            try:
-                line = input(prompt)
-            except EOFError:
-                return
-            result_q.put(line)
+def ensure_csv():
+    if not os.path.exists(LOG_CSV):
+        with open(LOG_CSV, "w", newline="") as f:
+            csv.writer(f).writerow(LOG_COLUMNS)
 
-        t = threading.Thread(target=_reader, daemon=True)
-        t.start()
-        try:
-            return result_q.get(timeout=timeout_sec)
-        except queue.Empty:
+
+def append_row(row):
+    with open(LOG_CSV, "a", newline="") as f:
+        csv.writer(f).writerow([row.get(c, "") for c in LOG_COLUMNS])
+
+
+# ------------------------------------------------------------ indicators -----
+def ema(s, n):
+    return s.ewm(span=n, adjust=False).mean()
+
+
+def wma(s, n):
+    w = np.arange(1, n + 1, dtype=float)
+    return s.rolling(n).apply(lambda x: np.dot(x, w) / w.sum(), raw=True)
+
+
+def hma(s, n):
+    return wma(2 * wma(s, 3) - wma(s, n), 3)
+
+
+def best_fit_angle_series(vals, npts):
+    """Angle (degrees) of the best-fit line through each window of npts points:
+    slope as % of the window's mean value per bar, then arctan."""
+    x = np.arange(npts, dtype=float)
+    xc = x - x.mean()
+    den = (xc ** 2).sum()
+    arr = np.asarray(vals, dtype=float)
+    out = np.full(len(arr), np.nan)
+    for i in range(npts - 1, len(arr)):
+        y = arr[i - npts + 1:i + 1]
+        if np.isnan(y).any():
+            continue
+        m = y.mean()
+        if m == 0:
+            continue
+        slope = (xc * (y - m)).sum() / den
+        out[i] = math.degrees(math.atan(slope / m * 100.0))
+    return out
+
+
+def compute_arrays(today_df):
+    """All lines/angles for today's bars (causal: value at bar k uses only bars <= k)."""
+    close = today_df["close"].astype(float)
+    black = ema(close, EMA_LEN)
+    red = hma(close, HMA_LEN)
+    return {
+        "close": close.to_numpy(), "high": today_df["high"].astype(float).to_numpy(),
+        "black": black.to_numpy(), "red": red.to_numpy(),
+        "black_ang": best_fit_angle_series(black.to_numpy(), ANGLE_LOOKBACK + 1),
+        "price_ang": best_fit_angle_series(close.to_numpy(), PRICE_ANGLE_POINTS),
+        "red_ang": best_fit_angle_series(red.to_numpy(), RED_ANGLE_POINTS),
+    }
+
+
+def hhmm(s):
+    h, m = s.split(":")
+    return int(h) * 60 + int(m)
+
+
+def et_minutes(ts):
+    t = pd.Timestamp(ts).tz_convert(ET)
+    return t.hour * 60 + t.minute
+
+
+def az_label(ts):
+    return pd.Timestamp(ts).tz_convert(AZ).strftime("%-I:%M %p AZ")
+
+
+# ------------------------------------------------------------ the system -----
+def buy_signal(A, k, ts):
+    """True if the BUY rule holds on bar k."""
+    if k < WARMUP_BARS or k < 1:
+        return False
+    vals = (A["red"][k], A["red"][k - 1], A["black"][k], A["black"][k - 1],
+            A["price_ang"][k], A["black_ang"][k])
+    if any(math.isnan(v) for v in vals):
+        return False
+    m = et_minutes(ts)
+    if not (hhmm(ALERT_START_ET) <= m < hhmm(ALERT_END_ET)):
+        return False
+    crossed = A["red"][k - 1] <= A["black"][k - 1] and A["red"][k] > A["black"][k]
+    return (crossed and A["price_ang"][k] >= CROSS_MIN_ANGLE and A["black_ang"][k] > SHALLOWED)
+
+
+def exit_reason(A, k, ts, entry):
+    """Why to get out on bar k, or None (stay). Same order as the history test."""
+    if A["close"][k] <= entry * (1 - STOP_PCT / 100.0):
+        return f"stop: down {STOP_PCT:.1f}% from the alert price"
+    if A["red"][k] < A["black"][k]:
+        return "red line touched the black line"
+    ra = A["red_ang"][k]
+    if not math.isnan(ra) and ra <= -SHARP_EXIT_ANGLE:
+        return f"sharp peak: red line turned down at {ra:.0f} deg"
+    if et_minutes(ts) >= hhmm(EOD_ET):
+        return "end of day"
+    return None
+
+
+# ------------------------------------------------------------ TradeStation ---
+class Client:
+    """READ-ONLY market data. There is no order code anywhere in this file."""
+
+    def __init__(self):
+        self.cid = (os.getenv("TS_CLIENT_ID") or os.getenv("TS_API_KEY")
+                    or os.getenv("TRADESTATION_CLIENT_ID"))
+        self.sec = (os.getenv("TS_CLIENT_SECRET") or os.getenv("TS_SECRET")
+                    or os.getenv("TRADESTATION_CLIENT_SECRET"))
+        self.rt = os.getenv("TS_REFRESH_TOKEN") or os.getenv("TRADESTATION_REFRESH_TOKEN")
+        self.env = (os.getenv("TS_ENV") or "sim").lower()
+        if self.env not in TS_BASE:
+            raise SystemExit(f"TS_ENV must be 'sim' or 'live', got {self.env!r}")
+        miss = [n for n, v in (("TS_CLIENT_ID", self.cid), ("TS_CLIENT_SECRET", self.sec),
+                               ("TS_REFRESH_TOKEN", self.rt)) if not v]
+        if miss:
+            raise SystemExit(f"FATAL: missing TradeStation creds in .env: {miss}")
+        self.base = TS_BASE[self.env]
+        self.tok = None
+        self.exp = 0.0
+        self.s = requests.Session()
+        self.use_template = True
+
+    def token(self):
+        if self.tok and time.time() < self.exp - 60:
+            return self.tok
+        r = self.s.post(TS_OAUTH_URL, data={"grant_type": "refresh_token", "client_id": self.cid,
+                                            "client_secret": self.sec, "refresh_token": self.rt},
+                        timeout=15)
+        r.raise_for_status()
+        j = r.json()
+        self.tok = j["access_token"]
+        self.exp = time.time() + int(j.get("expires_in", 1200))
+        return self.tok
+
+    def bars(self, symbol):
+        params = {"interval": 1, "unit": "Minute", "barsback": BAR_LOOKBACK}
+        if self.use_template:
+            params["sessiontemplate"] = SESSION_TEMPLATE
+        r = self.s.get(self.base + f"/marketdata/barcharts/{symbol}",
+                       headers={"Authorization": f"Bearer {self.token()}"}, params=params, timeout=20)
+        if r.status_code == 400 and self.use_template:
+            log(f"WARN TradeStation rejected sessiontemplate={SESSION_TEMPLATE} ({r.text[:120]!r}). "
+                f"Retrying without it -- that gives REGULAR-HOURS bars only, so pre-market lines "
+                f"are NOT available and every ticker will be skipped.")
+            self.use_template = False
+            return self.bars(symbol)
+        r.raise_for_status()
+        data = r.json().get("Bars", [])
+        if not data:
             return None
-
-    def run_forever(self):
-        while _RUNNING:
-            try:
-                symbol, price, ts, kind, reason = approval_queue.get(timeout=1)
-            except queue.Empty:
-                continue
-
-            if kind == "BUY":
-                header = f"BUY SIGNAL -- {symbol} @ ~${price:.2f}"
-                ask = "Type Y and press Enter to BUY, or just press Enter to skip."
-            else:
-                header = f"SELL SIGNAL -- {symbol} @ ~${price:.2f}  ({reason})"
-                ask = "Type Y and press Enter to SELL, or just press Enter to keep holding."
-
-            banner = (
-                f"\n{'='*60}\n{header}\n{'='*60}\n{ask}\n"
-                f"(you have {POPUP_TIMEOUT_SECONDS} seconds -- after that it auto-"
-                f"{'skips' if kind=='BUY' else 'expires (stays held)'})\n> "
-            )
-
-            answer = self._read_line_with_timeout(banner, POPUP_TIMEOUT_SECONDS)
-
-            if answer is None:
-                decision_queue.put((f"EXPIRED_{kind}", symbol, price, ts))
-                print(f"(no answer in time -- {symbol} {kind} EXPIRED)")
-                continue
-
-            if answer.strip().lower() in ("y", "yes"):
-                decision_queue.put((f"APPROVE_{kind}", symbol, price, ts))
-            else:
-                decision_queue.put((f"SKIP_{kind}", symbol, price, ts))
+        rows, ts = [], []
+        for b in data:
+            ts.append(pd.Timestamp(b["TimeStamp"]))
+            rows.append({"open": float(b["Open"]), "high": float(b["High"]),
+                         "low": float(b["Low"]), "close": float(b["Close"])})
+        idx = pd.DatetimeIndex([t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+                                for t in ts])
+        df = pd.DataFrame(rows, index=idx).sort_index()
+        return df.iloc[:-1] if len(df) > 1 else df     # drop the still-forming bar
 
 
-def slots_in_use():
-    # 2026-10-15: positions held PLUS buys waiting for your answer
-    return len(open_positions) + len(pending_buy_meta)
+def today_bars(df, now_et):
+    """Bars from today (ET date), including pre-market (04:00 ET on)."""
+    et = df.index.tz_convert(ET)
+    mask = np.array([t.date() == now_et.date() for t in et]) & \
+           np.array([t.hour * 60 + t.minute >= 4 * 60 for t in et])
+    return df[mask]
 
 
-def pair_leg_open(sym):
-    # RE-ENABLED 2026-10-15 (Gary): won't alert on one side of a pair while the
-    # other side is held or waiting for your answer. Matches Engine A.
-    partner = PARTNER.get(sym)
-    return bool(partner) and (partner in open_positions or partner in pending_buy_meta)
+# ------------------------------------------------------------ per-ticker step
+def process_bar(sym, A, idx, k, state, now_check=True):
+    """Apply the system to bar k of today's series. Prints alerts, logs closed trades."""
+    ts = idx[k]
+    pos = state["pos"].get(sym)
+    if pos is not None:
+        if k <= pos["k"]:
+            return
+        pos["maxhigh"] = max(pos["maxhigh"], A["high"][k])
+        if (pd.Timestamp(ts) - pd.Timestamp(pos["ts"])).total_seconds() / 60.0 <= HI_WINDOW_MIN:
+            pos["hi8"] = max(pos["hi8"], A["high"][k])
+        why = exit_reason(A, k, ts, pos["entry"])
+        if why:
+            px = A["close"][k]
+            pnl = (px / pos["entry"] - 1) * 100
+            mins = int(round((pd.Timestamp(ts) - pd.Timestamp(pos["ts"])).total_seconds() / 60.0))
+            print("\a\n" + "-" * 60 + f"\nWINNING SIDE -- EXIT: {sym} @ ~${px:.2f}  ({az_label(ts)})"
+                  f"   {pnl:+.1f}%  after {mins} min\nReason: {why}\n" + "-" * 60 + "\n", flush=True)
+            log(f"EXIT {sym} @ {px:.4f} pnl={pnl:+.2f}% held={mins}min reason={why}")
+            append_row({"date": pd.Timestamp(ts).tz_convert(ET).strftime("%Y-%m-%d"), "ticker": sym,
+                        "alert_time_az": az_label(pos["ts"]), "alert_price": f"{pos['entry']:.4f}",
+                        "price_angle": f"{pos['pang']:.0f}", "black_angle": f"{pos['bang']:+.1f}",
+                        "exit_time_az": az_label(ts), "exit_price": f"{px:.4f}", "pnl_pct": f"{pnl:+.2f}",
+                        "exit_reason": why, "minutes_held": mins,
+                        "high_within_8min_pct": f"{(pos['hi8'] / pos['entry'] - 1) * 100:+.2f}",
+                        "high_before_exit_pct": f"{(pos['maxhigh'] / pos['entry'] - 1) * 100:+.2f}"})
+            state["pos"].pop(sym, None)
+        return
+    if buy_signal(A, k, ts):
+        px = A["close"][k]
+        state["pos"][sym] = {"k": k, "ts": ts, "entry": px, "maxhigh": A["high"][k], "hi8": A["high"][k],
+                             "pang": A["price_ang"][k], "bang": A["black_ang"][k]}
+        print("\a\n" + "=" * 60 + f"\nWINNING SIDE -- ALERT: BUY {sym} @ ~${px:.2f}   ({az_label(ts)})\n"
+              f"Red line crossed UP through black.   Price angle: {A['price_ang'][k]:.0f} deg   "
+              f"Black line angle: {A['black_ang'][k]:+.1f} deg\n"
+              f"Plan: stay in until red touches black, or red turns sharply down ({-SHARP_EXIT_ANGLE:.0f} deg), "
+              f"or -{STOP_PCT:.0f}% from here.\n"
+              f"ALERT ONLY -- nothing was bought. Buy it yourself in TradeStation if you want it.\n"
+              + "=" * 60 + "\n", flush=True)
+        log(f"ALERT {sym} @ {px:.4f} price-angle={A['price_ang'][k]:.0f} black-angle={A['black_ang'][k]:+.1f}")
 
 
-def signal_worker(api):
-    """Watches every symbol, asks for your approval the instant the 2-part
-    signal fires -- black line's current angle is shallow enough, AND the
-    red line is rising 2 bars in a row, both true on the SAME bar
-    (2026-08-31, Gary's decision: RSI dropped entirely -- extensive
-    testing found it added no real predictive value, mostly just delay).
-    No arm-tracking or multi-bar alignment window needed now that there
-    are only two conditions to check, and they're required
-    simultaneously."""
-    last_signaled_bar = {s: None for s in SYMBOLS}
-    alert_armed = {s: True for s in SYMBOLS}   # B2: one alert per run
-    stale_logged = set()
-
-    log(f"Signal worker started. Black-line check: current angle must be above "
-        f"{SHALLOWED:.1f} degrees. Red line still rising now, with "
-        f"MIN_BEND_PCT={MIN_BEND_PCT:.2f}% over {BEND_LOOKBACK_BARS} bars. "
-        f"Red must be BELOW black; stale-bar guard {STALE_BAR_MINUTES} min; one prompt per signal run. "
-        f"MAX_SLOTS={MAX_SLOTS}, pair-lock ON.")
-
-    while _RUNNING:
-        now_et = et_now()
-        if not in_session(now_et):
-            time.sleep(POLL_SECONDS)
-            continue
-
-        for sym in SYMBOLS:
-            if sym in open_positions:
-                continue
-            try:
-                df = api.get_bars(sym)
-                df = session_filter(df) if df is not None else None
-                if df is None or len(df) < WARMUP_BARS + ANGLE_LOOKBACK + 35:
-                    continue
-                fr = build_frame(df)
-                latest_frame[sym] = fr   # cache for the live status board
-            except Exception as e:
-                log(f"WARN {sym}: {e}")
-                continue
-
-            # B2: ignore bars that are not from today or are stale (see header)
-            try:
-                last_bar_et = pd.Timestamp(fr.ts).tz_convert(ET)
-                bar_age_min = (now_et - last_bar_et).total_seconds() / 60.0
-            except Exception:
-                continue
-            if last_bar_et.date() != now_et.date() or bar_age_min > STALE_BAR_MINUTES:
-                if sym not in stale_logged:
-                    stale_logged.add(sym)
-                    log(f"STALE-SKIP {sym}: newest bar is {last_bar_et.strftime('%Y-%m-%d %H:%M')} ET "
-                        f"({bar_age_min:.1f} min old) -- waiting for fresh bars from today")
-                continue
-
-            if fr.bar_index < WARMUP_BARS:
-                continue
-
-            # 2026-10-15: same conditions as Engine A (RSI-dip requirement removed)
-            # B2 BELOW-BLACK (2026-10-13, Gary's decision): only alert when the red
-            # line (HMA7) is BELOW the black line (EMA20). Red well above black
-            # is more likely overbought, and several of those alerts on 10/13
-            # morning were not good. History test (1,984 ticker-days): red-below-
-            # black alerts reached +1% in 10 min 44% of the time vs 38% above.
-            red_below_black = (not math.isnan(fr.black_now)) and fr.red_now < fr.black_now
-            if not (black_gate_open(fr) and red_rising(fr) and red_below_black):
-                alert_armed[sym] = True   # conditions ended; the next time they hold is a NEW alert
-                continue
-            if not alert_armed[sym]:
-                continue   # same run as an alert already raised -- do not ask again
-            alert_armed[sym] = False
-
-            sig_key = (str(now_et.date()), fr.bar_index)
-            if last_signaled_bar[sym] == sig_key:
-                continue
-            last_signaled_bar[sym] = sig_key
-
-            # ---- safety protections, ported from the plain system ----
-            if slots_in_use() >= MAX_SLOTS:
-                log(f"SLOT-SKIP {sym} (slots full {MAX_SLOTS})")
-                continue
-            if pair_leg_open(sym):
-                log(f"PAIR-SKIP {sym} (partner {PARTNER[sym]} already open)")
-                continue
-
-            log(f"SIGNAL {sym} @ {fr.close:.4f} bar={fr.bar_index} "
-                f"angle={fr.angle_now:+.1f} red-vs-black={(fr.red_now/fr.black_now-1)*100:+.2f}% -- ASKING FOR YOUR APPROVAL "
-                f"(double-cyborg mode, ~{shares_for_dollars(fr.close)} shares, "
-                f"~${TRADE_DOLLARS} notional)")
-            pending_buy_meta[sym] = {
-                "entry_angle_now": fr.angle_now,
-                "entry_angle_was": fr.angle_was,
-            }
-            approval_queue.put((sym, fr.close, None, "BUY", "signal fired"))
-
-        time.sleep(POLL_SECONDS)
-
-
-STATUS_BOARD_SECONDS = 60   # how often the live status board prints
-
-
-def status_board_worker():
-    """Prints a one-line status board every minute showing what every
-    ticker is currently doing (black-line angle, red-line direction) --
-    same idea as the plain system's live board, added 2026-08-27 per Gary's
-    request so you can watch the angle move toward the threshold, even on
-    minutes where nothing fires."""
-    while _RUNNING:
-        time.sleep(STATUS_BOARD_SECONDS)
-        now_et = et_now()
-        if not in_session(now_et):
-            continue
-        if not latest_frame:
-            continue
-
-        lines = []
-        for sym in SYMBOLS:
-            fr = latest_frame.get(sym)
-            if fr is None:
-                if sym in open_positions:
-                    lines.append(f"{sym}:HOLDING")
-                else:
-                    lines.append(f"{sym}:no data yet")
-                continue
-            red_dir = "up" if fr.red_now > fr.red_prev else "down"
-            held = " [HOLDING]" if sym in open_positions else ""
-            lines.append(
-                f"{sym}:angle={fr.angle_now:+5.1f}deg red={red_dir}{held}"
-            )
-
-        log("--- status board ---")
-        # print 3 tickers per line so it stays readable in a normal terminal width
-        for i in range(0, len(lines), 3):
-            print("   " + "   |   ".join(lines[i:i + 3]), flush=True)
-
-
-RECONCILE_SECONDS = 10   # how often to check the real account for manual sells
-
-
-def reconcile_positions_worker(api):
-    """ADDED (2026-09-03, Gary's decision): now that all selling is
-    manual, this check becomes essential -- periodically checks the
-    REAL broker account directly, and clears out anything this script
-    thinks it's still holding that's actually already gone (sold
-    manually by Gary, directly in TradeStation). Without this, a
-    manually-sold ticker would be permanently blocked from ever
-    trading again, since the script would keep believing it's still
-    held. Matches the same check already running in Engine A."""
-    while _RUNNING:
-        time.sleep(RECONCILE_SECONDS)
-        if not open_positions:
-            continue
+def premarket_check(client):
+    now_et = datetime.now(ET)
+    log(f"PREMARKET CHECK: asking TradeStation for bars with sessiontemplate={SESSION_TEMPLATE}")
+    ok = 0
+    for sym in SYMBOLS:
         try:
-            real_positions = api.list_positions()
+            df = client.bars(sym)
+            if df is None:
+                log(f"PREMARKET CHECK {sym}: no bars returned")
+                continue
+            t = today_bars(df, now_et)
+            et = t.index.tz_convert(ET)
+            pm = sum(1 for x in et if x.hour * 60 + x.minute < 9 * 60 + 30)
+            first = et[0].strftime("%H:%M") if len(et) else "none"
+            log(f"PREMARKET CHECK {sym}: {len(t)} bars today, {pm} before 9:30 ET, earliest {first} ET"
+                + ("" if pm >= MIN_PM_BARS or now_et.hour * 60 + now_et.minute < 9 * 60 + 30
+                   else "   <-- TOO FEW, this ticker will be skipped"))
+            ok += pm >= MIN_PM_BARS
         except Exception as e:
-            log(f"WARN reconcile check failed: {e}")
-            continue
-
-        for sym in list(open_positions.keys()):
-            real = real_positions.get(sym)
-            if real is None or real.get("qty", 0) == 0:
-                pos = open_positions.pop(sym, None)
-                log(f"RECONCILE: {sym} is no longer held in the real account "
-                    f"(sold manually, outside this script) -- clearing it "
-                    f"from memory so it can trade again.")
-                if pos:
-                    try:
-                        quote = api.get_latest_trade(sym)
-                        exit_price = quote.price
-                    except Exception:
-                        exit_price = None
-                    entry = pos.get("entry", 0)
-                    if exit_price and entry:
-                        pnl_pct = (exit_price / entry - 1) * 100
-                        exit_str = f"{exit_price:.4f}"
-                        pnl_str = f"{pnl_pct:+.2f}"
-                    else:
-                        exit_str = "unknown (sold manually)"
-                        pnl_str = ""
-                    append_trade_row({
-                        "time_opened": pos.get("opened_ts", ""),
-                        "time_closed": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
-                        "ticker": sym, "entry": f"{entry:.4f}" if entry else "",
-                        "exit_price": exit_str,
-                        "qty": pos.get("qty", ""), "pnl_pct": pnl_str,
-                        "reason": "manual sell outside script (detected by reconcile check)",
-                        "angle_now_at_entry": pos.get("entry_angle_now", ""),
-                        "angle_was_at_entry": pos.get("entry_angle_was", ""),
-                    })
-
-
-def sell_monitor_worker(api):
-    """RESTORED (2026-09-21, Gary's decision): automatic selling is back --
-    -2% hard stop-loss (STOP_PCT), 2.5% trailing stop once in profit
-    (TRAIL_PCT), and an end-of-day flatten at EOD_FLATTEN_ET. All three
-    fire automatically, with NO approval prompt -- the one exception to
-    this engine's normal "everything asks first" rule, because these are
-    safety nets, not trading decisions. Buying (and the BUY side of
-    decision_worker) is untouched and still requires your typed approval.
-    This reverses the 2026-09-03 change that removed all automatic
-    selling; that change left positions carried over indefinitely,
-    including overnight, with zero automatic protection, which is what
-    prompted restoring this (matches the same fix in Engine A)."""
-    eod_done_today = None  # date EOD flatten last ran, so it only fires once/day
-    while _RUNNING:
-        now_et = et_now()
-        if not in_session(now_et):
-            time.sleep(POLL_SECONDS)
-            continue
-
-        # ---- end-of-day flatten: sell everything still open, once ----
-        oh, om = _hhmm(EOD_FLATTEN_ET)
-        if (now_et.hour, now_et.minute) >= (oh, om) and eod_done_today != now_et.date():
-            for sym, pos in list(open_positions.items()):
-                qty = pos.get("qty", 1)
-                try:
-                    result = api.market_sell(sym, qty)
-                    log(f"EOD-FLATTEN {sym}: sell order result {result} ({qty} shares)")
-                except Exception as e:
-                    log(f"EOD-FLATTEN-ERR {sym}: {e}")
-                    continue
-                entry = pos.get("entry", 0)
-                try:
-                    quote = api.get_latest_trade(sym)
-                    exit_price = quote.price
-                except Exception:
-                    exit_price = entry
-                pnl_pct = (exit_price / entry - 1) * 100 if entry else 0.0
-                append_trade_row({
-                    "time_opened": pos.get("opened_ts", ""),
-                    "time_closed": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
-                    "ticker": sym, "entry": f"{entry:.4f}" if entry else "",
-                    "exit_price": f"{exit_price:.4f}",
-                    "qty": qty, "pnl_pct": f"{pnl_pct:+.2f}", "reason": "end-of-day flatten",
-                    "angle_now_at_entry": pos.get("entry_angle_now", ""),
-                    "angle_was_at_entry": pos.get("entry_angle_was", ""),
-                })
-                open_positions.pop(sym, None)
-            eod_done_today = now_et.date()
-            time.sleep(POLL_SECONDS)
-            continue
-
-        for sym, pos in list(open_positions.items()):
-            try:
-                quote = api.get_latest_trade(sym)
-                price = quote.price
-            except Exception as e:
-                log(f"WARN could not get price for open position {sym}: {e}")
-                continue
-            pos["peak"] = max(pos["peak"], price)
-            entry = pos.get("entry", price)
-            peak = pos["peak"]
-            qty = pos.get("qty", 1)
-
-            stop_hit = entry and price <= entry * (1 - STOP_PCT / 100)
-            trail_hit = peak > entry and price <= peak * (1 - TRAIL_PCT / 100)
-
-            if not (stop_hit or trail_hit):
-                continue
-
-            reason = "stop-loss" if stop_hit else "trailing-stop"
-            try:
-                result = api.market_sell(sym, qty)
-                log(f"{reason.upper()} {sym} @ {price:.4f} (entry {entry:.4f}, peak {peak:.4f}) "
-                    f"-- sell order result {result}")
-            except Exception as e:
-                log(f"{reason.upper()}-ERR {sym}: {e}")
-                continue
-            pnl_pct = (price / entry - 1) * 100 if entry else 0.0
-            append_trade_row({
-                "time_opened": pos.get("opened_ts", ""),
-                "time_closed": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
-                "ticker": sym, "entry": f"{entry:.4f}" if entry else "",
-                "exit_price": f"{price:.4f}",
-                "qty": qty, "pnl_pct": f"{pnl_pct:+.2f}", "reason": reason,
-                "angle_now_at_entry": pos.get("entry_angle_now", ""),
-                "angle_was_at_entry": pos.get("entry_angle_was", ""),
-            })
-            open_positions.pop(sym, None)
-
-        time.sleep(POLL_SECONDS)
-
-
-def decision_worker(api):
-    """Waits for your typed answer, only THEN talks to TradeStation. Logs a
-    complete round-trip row to the CSV the moment a position actually closes.
-    DOUBLE-CYBORG (2026-08-30): now also waits for your approval on the BUY
-    side, not just the sell -- nothing is bought without you typing Y."""
-    while _RUNNING:
-        try:
-            action, symbol, price, ts = decision_queue.get(timeout=1)
-        except queue.Empty:
-            continue
-
-        if action == "APPROVE_BUY":
-            log(f"APPROVED by you -- buying {symbol} @ ~{price:.4f}")
-            qty = shares_for_dollars(price)
-            try:
-                result = api.market_buy(symbol, qty)
-                log(f"Buy order result for {symbol}: {result} ({qty} shares @ ${price:.2f})")
-                meta = pending_buy_meta.pop(symbol, {})
-                open_positions[symbol] = {
-                    "entry": price, "peak": price, "qty": qty,
-                    "opened_ts": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
-                    "entry_angle_now": meta.get("entry_angle_now", ""),
-                    "entry_angle_was": meta.get("entry_angle_was", ""),
-                }
-                log(f"Now tracking open position: {symbol} entry=${price:.2f} -- "
-                    f"will alert on sell via this terminal")
-            except Exception as e:
-                log(f"ERROR buying {symbol}: {e}")
-                pending_buy_meta.pop(symbol, None)
-        elif action == "SKIP_BUY":
-            log(f"SKIPPED by you: {symbol} @ ~{price} -- not buying this signal")
-            pending_buy_meta.pop(symbol, None)
-        elif action == "EXPIRED_BUY":
-            log(f"Buy alert EXPIRED (no answer within {POPUP_TIMEOUT_SECONDS}s): {symbol} -- not buying")
-            pending_buy_meta.pop(symbol, None)
-        elif action == "APPROVE_SELL":
-            log(f"APPROVED by you -- selling {symbol} @ ~{price:.4f}")
-            pos = open_positions.get(symbol, {})
-            qty = pos.get("qty", 1)
-            try:
-                result = api.market_sell(symbol, qty)
-                log(f"Sell order result for {symbol}: {result}")
-                entry = pos.get("entry", price)
-                pnl_pct = (price / entry - 1) * 100 if entry else 0.0
-                append_trade_row({
-                    "time_opened": pos.get("opened_ts", ""),
-                    "time_closed": datetime.now(AZ).strftime("%Y-%m-%d %H:%M:%S"),
-                    "ticker": symbol, "entry": f"{entry:.4f}", "exit_price": f"{price:.4f}",
-                    "qty": qty, "pnl_pct": f"{pnl_pct:+.2f}", "reason": "approved sell",
-                    "angle_now_at_entry": pos.get("entry_angle_now", ""),
-                    "angle_was_at_entry": pos.get("entry_angle_was", ""),
-                })
-                open_positions.pop(symbol, None)
-            except Exception as e:
-                log(f"ERROR placing sell for {symbol}: {e}")
-        elif action == "SKIP_SELL":
-            log(f"SKIPPED sell by you: {symbol} @ ~{price} -- still holding, will ask again if condition persists")
-        elif action == "EXPIRED_SELL":
-            log(f"Sell alert EXPIRED (no answer within {POPUP_TIMEOUT_SECONDS}s): {symbol} -- still holding")
+            log(f"PREMARKET CHECK {sym}: ERROR {e}")
+    log(f"PREMARKET CHECK done: {ok} of {len(SYMBOLS)} tickers have at least {MIN_PM_BARS} pre-market bars")
 
 
 def main():
-    _sig.signal(_sig.SIGINT, _stop)
-    _sig.signal(_sig.SIGTERM, _stop)
-
-    api = TradeStationClient()
-    api._access_token()
-    acct = api.get_account()
     ensure_csv()
-
-    log(f"Connected to TradeStation account {acct.account_number} "
-        f"(status={acct.status}, env={api.env}, dry_run={api.dry_run})")
-    if api.dry_run:
-        log("DRY_RUN is ON -- approvals will be logged but NOT sent as real orders. "
-            "Set DRY_RUN=0 in .env once you're ready to trade live with this.")
-
-    bal = api.get_balance()
-    log("=" * 70)
-    log("RSI MOD2 -- ENGINE B (Double Cyborg, self-contained file)")
-    log("=" * 70)
-    if bal:
-        log(f"BALANCE  equity=${bal['equity']:,.2f}  cash=${bal['cash']:,.2f}")
-        if api.env == "live" and not api.dry_run:
-            log("         ^ CHECK THIS ACCOUNT. Ctrl-C now if it is wrong.")
-    log(f"MODE     {RSI_MOD2_MODE}  |  SHALLOWED={SHALLOWED:.1f}  "
-        f"MIN_BEND_PCT={MIN_BEND_PCT:.2f}% over {BEND_LOOKBACK_BARS} bars  "
-        f"STOP_PCT={STOP_PCT:.1f}%  TRAIL_PCT={TRAIL_PCT:.1f}%  "
-        f"TRADE_DOLLARS=${TRADE_DOLLARS}  MAX_SLOTS={MAX_SLOTS}  RED_BELOW_BLACK=ON  STALE_BAR_MIN={STALE_BAR_MINUTES}  ANGLE_LOOKBACK={ANGLE_LOOKBACK}")
-    log(f"SUPPRESS per-ticker while open + global slots<={MAX_SLOTS} + same-pair lock")
+    client = Client()
+    log("WINNING SIDE (ALERT ONLY) starting. NO ORDERS are ever placed by this program.")
+    log(f"MODE     CROSS_MIN_ANGLE={CROSS_MIN_ANGLE:.0f} (price, {PRICE_ANGLE_POINTS} closes)  "
+        f"BLACK_GATE>{SHALLOWED:.0f} over {ANGLE_LOOKBACK} min  SHARP_EXIT=-{SHARP_EXIT_ANGLE:.0f}  "
+        f"STOP={STOP_PCT:.1f}%  WINDOW={ALERT_START_ET}-{ALERT_END_ET} ET  WARMUP={WARMUP_BARS}  "
+        f"MIN_PM_BARS={MIN_PM_BARS}  STALE_BAR_MIN={STALE_BAR_MINUTES}")
     log(f"UNIVERSE ({len(SYMBOLS)} tickers) {', '.join(SYMBOLS)}")
     log(f"LOG      {LOG_CSV}")
-    if api.env == "live" and not api.dry_run:
-        log("*** LIVE TRADING ENABLED -- real orders will be sent ***")
-    log("=" * 70)
-    log("Watching quietly now -- will only print again when a real signal, "
-        "buy, sell, or heartbeat happens. This is normal; no news is good news.")
+    premarket_check(client)
 
-    ui = TerminalApproval()
-
-    threading.Thread(target=ui.run_forever, daemon=True).start()
-    threading.Thread(target=signal_worker, args=(api,), daemon=True).start()
-    threading.Thread(target=sell_monitor_worker, args=(api,), daemon=True).start()
-    threading.Thread(target=reconcile_positions_worker, args=(api,), daemon=True).start()
-    threading.Thread(target=decision_worker, args=(api,), daemon=True).start()
-    threading.Thread(target=status_board_worker, daemon=True).start()
-
-    HEARTBEAT_SECONDS = 600
-    last_heartbeat = time.time()
+    state = {"pos": {}}
+    last_k = {}                 # sym -> timestamp of the last bar already processed
+    skipped_logged = set()
     while _RUNNING:
-        time.sleep(1)
-        if time.time() - last_heartbeat >= HEARTBEAT_SECONDS:
-            held = list(open_positions.keys())
-            log(f"(heartbeat) still watching {len(SYMBOLS)} tickers -- "
-                f"holding: {held if held else 'nothing right now'}")
-            last_heartbeat = time.time()
+        now_et = datetime.now(ET)
+        m = now_et.hour * 60 + now_et.minute
+        if now_et.weekday() >= 5 or m >= hhmm(CLOSE_ET):
+            time.sleep(60)
+            continue
+        busy = bool(state["pos"]) or (hhmm(ALERT_START_ET) - 2 <= m < hhmm(ALERT_END_ET))
+        if not busy:
+            time.sleep(30)
+            continue
+        for sym in SYMBOLS:
+            try:
+                df = client.bars(sym)
+                if df is None:
+                    continue
+                t = today_bars(df, now_et)
+                if len(t) < WARMUP_BARS + ANGLE_LOOKBACK + 2:
+                    continue
+                et = t.index.tz_convert(ET)
+                pm = sum(1 for x in et if x.hour * 60 + x.minute < 9 * 60 + 30)
+                if pm < MIN_PM_BARS:
+                    if sym not in skipped_logged and m >= 9 * 60 + 30:
+                        skipped_logged.add(sym)
+                        log(f"SKIP {sym}: only {pm} pre-market bars today (need {MIN_PM_BARS}) -- no alerts for it today")
+                    continue
+                age_min = (now_et - pd.Timestamp(t.index[-1]).tz_convert(ET)).total_seconds() / 60.0
+                if age_min > STALE_BAR_MINUTES:
+                    continue
+                A = compute_arrays(t)
+                n = len(t)
+                if sym not in last_k:
+                    last_k[sym] = t.index[-1]        # start from now; do not alert on old bars
+                    continue
+                start = int(np.searchsorted(t.index.values, np.datetime64(last_k[sym].tz_convert("UTC").tz_localize(None)), side="right"))
+                for k in range(start, n):
+                    process_bar(sym, A, t.index, k, state)
+                last_k[sym] = t.index[-1]
+            except Exception as e:
+                log(f"WARN {sym}: {e}")
+        time.sleep(POLL_SECONDS)
+    log("stopped. open paper trades at shutdown: " + (", ".join(state["pos"]) or "none"))
 
 
 if __name__ == "__main__":
