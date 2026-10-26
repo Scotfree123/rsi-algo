@@ -1,5 +1,32 @@
 #!/usr/bin/env python3
 """
+CHANGED 2026-10-25 (Gary's decision) -- THIS FILE: rsi_engineB_redline.py
+    Built from rsi_engineB_crossup2.py (a59d86a6). ENGINE B IS NOW A "LOOK, THEN DECIDE" ALERT SCREEN.
+    1. NEW SIGNAL "RED-LINE BUY" (replaces the old RED TURN-UP): the red line's rise over the last
+       3 one-minute bars, as a percent of price per minute, converted to an angle, is at least
+       REDLINE_MIN_ANGLE (13 degrees, about +0.7% in 3 minutes); red is still rising this bar;
+       red is BELOW black; the black line's 10-minute angle is above -35 (REDLINE_BLACK_GATE,
+       was -15). Strength word from the same angle: STRONG >= 25, MEDIUM >= 18, WEAK >= 13.
+    2. STEEP CROSS-UP kept exactly as it was (price angle >= 30, black gate -15). Printed "CROSS-UP BUY".
+    3. NO MORE Y/Enter questions. Alerts go on a numbered BUY ALERT list under the status board.
+       To buy: type the number and press Enter (several numbers with a space also work). Doing
+       nothing buys nothing. An alert leaves the list when its signal ends, when you buy it, when you
+       hold it, or after ALERT_LIST_MAX_MINUTES (10). Numbers never change while a stock is on the
+       list and are never reused during a run. An alert stays up at least ALERT_MIN_MINUTES (3) even if its
+       signal ends sooner, so you have time to look. A stock never appears twice (a red-line alert that
+       then crosses up stays on the same number and becomes CROSS-UP BUY).
+    4. At most MAX_NEW_PER_MINUTE (3) NEW alerts are shown per minute, strongest first; the rest are
+       only written to the alerts CSV. Every alert (shown or not) goes to engineB_alerts_log.csv.
+    5. LINES NOW USE PRE-MARKET BARS (04:00 ET on) when a stock has at least MIN_PM_BARS (10) of them
+       today, so alerts can start at the open. Otherwise that stock falls back to lines from 9:30.
+       Needs TradeStation sessiontemplate=USEQPreAndPost. A PREMARKET CHECK prints at startup.
+    6. 14 stocks, alphabetical: AAOX ASTX BEX BEZ CORD CWVX IRE LITX NBIL SMCX SNDQ SNXX SOXL SOXS.
+       Pair lock only for BEX/BEZ, CWVX/CORD, SNXX/SNDQ, SOXL/SOXS.
+    7. No new alerts or buys after NO_NEW_AFTER_ET (15:58 ET = 12:58 PM Arizona) -- now enforced.
+    8. The status board is unchanged. Sells unchanged (-2% stop, 2.5% trail, flat at 15:59 ET).
+    9. After a buy it prints BOUGHT ... and says plainly whether a real order was sent or whether
+       DRY_RUN is ON (test mode, no order).
+
 ============================================================
   ENGINE B -- DOUBLE CYBORG  (built 2026-08-30, updated through
   2026-09-21 evening -- signal rule now matches Engine A's final
@@ -167,6 +194,7 @@ import math
 import signal as _sig
 import threading
 import queue
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -234,6 +262,18 @@ TRAIL_PCT = 2.5
 SELL_ALERT_COOLDOWN_SECONDS = 90
 POPUP_TIMEOUT_SECONDS = 45    # CHANGED 2026-10-20 (Gary): 45 s. (2026-09-03: 180 s; was 600)
 CROSS_MIN_ANGLE = 30.0        # 2026-10-21: steep cross-up alert needs PRICE angle >= this (degrees)
+REDLINE_ANGLE_BARS = 3        # 2026-10-25: red-line rise is measured over this many minutes
+REDLINE_MIN_ANGLE = 13.0      # degrees; 13 deg over 3 min is about +0.7% rise
+STRONG_ANGLE = 25.0           # strength words, same angle
+MEDIUM_ANGLE = 18.0
+REDLINE_BLACK_GATE = -35.0    # black-line 10-minute angle must be above this for a RED-LINE BUY
+ALERT_LIST_MAX_MINUTES = 10   # an alert leaves the BUY ALERT list after this long
+ALERT_MIN_MINUTES = 3         # an alert stays up at least this long even if its signal ends sooner (time to look)
+MAX_NEW_PER_MINUTE = 3        # at most this many NEW alerts shown per minute (strongest first)
+REALERT_COOLDOWN_BARS = 10    # same stock cannot get a new red-line alert sooner than this many bars
+MIN_PM_BARS = 10              # fewer pre-market bars than this today -> that stock uses lines from 9:30
+SESSION_TEMPLATE = "USEQPreAndPost"
+ALERT_LOG_CSV = os.getenv("ALERT_LOG_CSV") or "engineB_alerts_log.csv"
 CROSS_RED_POINTS = 4          # points used for the best-fit angle (price closes) -- matches the backtest
                               # (10 min), now 3 min -- if you don't answer a
                               # buy prompt in this long,
@@ -284,22 +324,10 @@ RSI_MOD2_MODE = "DOUBLE_CYBORG"  # both buy AND sell need your approval
 # while trade quality is the same or slightly BETTER (avg peak
 # actually improved, from 6.55% to 7.27%, in the smaller group).
 PAIRS = [
-    ("NBIL", "NBIZ"),
-    ("IRE",  "IREZ"),
-    ("SNXX", "SNDQ"),
-    ("LITX", "LITZ"),
-    ("AAOX", "AAOZ"),
-    ("APLX", "APLZ"),
-    ("BEX",  "BEZ"),
-    ("SMCX", "SMCZ"),
-    ("RKLX", "RKLZ"),
-    ("ASTX", "ASTN"),
-    ("CWVX", "CORD"),
-]  # FINAL LIST (2026-09-03, Gary's decision, after a full day of live
-   # testing plus careful review of volume, correlation, and news for
-   # every candidate). AAOX/AAOZ, ASTX/ASTN, CWVX/CORD, and CBRX/CBRZ
-   # all considered and set aside for this final cut.
-SYMBOLS = [s for pr in PAIRS for s in pr]
+    ("AAOX",), ("ASTX",), ("BEX", "BEZ"), ("CWVX", "CORD"), ("IRE",),
+    ("LITX",), ("NBIL",), ("SMCX",), ("SNXX", "SNDQ"), ("SOXL", "SOXS"),
+]  # 2026-10-25 (Gary): 14 stocks. Pair lock only where a stock has an inverse partner here.
+SYMBOLS = sorted(s for pr in PAIRS for s in pr)   # alphabetical: the status board reads in this order
 PARTNER = {}
 for _grp in PAIRS:
     if len(_grp) == 2:
@@ -311,7 +339,7 @@ if _dupes:
     raise SystemExit(f"FATAL: duplicate symbols in PAIRS: {sorted(_dupes)}")
 
 BAR_MINUTES = 1
-BAR_LOOKBACK = 400
+BAR_LOOKBACK = 1000   # 2026-10-25: more bars back, because pre-market bars are included
 MARKET_OPEN_ET = "09:30"
 MARKET_CLOSE_ET = "16:00"
 NO_NEW_AFTER_ET = "15:58"
@@ -319,7 +347,7 @@ EOD_FLATTEN_ET = "15:59"
 POLL_SECONDS = int(os.getenv("POLL_SECONDS") or 20)
 
 # Separate log file from the plain system's, so they never collide.
-LOG_CSV = os.getenv("MOD2_CYBORG_LOG") or "rsi_engineB_matchA_log.csv"
+LOG_CSV = os.getenv("MOD2_CYBORG_LOG") or "rsi_engineB_redline_log.csv"
 LOG_COLUMNS = [
     "time_opened", "time_closed", "ticker", "entry", "exit_price",
     "qty", "pnl_pct", "reason",
@@ -475,6 +503,7 @@ class TradeStationClient:
         self._token = None
         self._token_exp = 0.0
         self._session = requests.Session()
+        self.use_template = True    # 2026-10-25: ask for pre-market bars
 
     def _access_token(self):
         if self._token and time.time() < self._token_exp - 60:
@@ -511,7 +540,17 @@ class TradeStationClient:
     def get_bars(self, symbol, limit=None):
         params = {"interval": BAR_MINUTES, "unit": "Minute",
                   "barsback": limit or BAR_LOOKBACK}
-        data = self._get(f"/marketdata/barcharts/{symbol}", params)
+        if self.use_template:
+            params["sessiontemplate"] = SESSION_TEMPLATE
+        r = self._session.get(self.base + f"/marketdata/barcharts/{symbol}",
+                              headers=self._headers(), params=params, timeout=20)
+        if r.status_code == 400 and self.use_template:
+            log(f"WARN TradeStation rejected sessiontemplate={SESSION_TEMPLATE} ({r.text[:120]!r}). "
+                f"Retrying without it: that gives REGULAR-HOURS bars only, so every stock uses lines from 9:30.")
+            self.use_template = False
+            return self.get_bars(symbol, limit)
+        r.raise_for_status()
+        data = r.json()
         bars = data.get("Bars", [])
         if not bars:
             return None
@@ -756,6 +795,82 @@ def red_rising(fr: Frame) -> bool:
     return bend_pct >= MIN_BEND_PCT
 
 
+def prepare_today(df, now_et):
+    """2026-10-25: keep TODAY's bars only. If the stock has at least MIN_PM_BARS pre-market bars today
+    (04:00-09:30 ET) the lines use them (starting 04:00 ET); otherwise lines start at 09:30 ET.
+    Returns (frame, used_premarket, premarket_bar_count)."""
+    et = df.index.tz_convert(ET)
+    mins = np.asarray(et.hour) * 60 + np.asarray(et.minute)
+    is_today = np.asarray(et.date == now_et.date())
+    pm_n = int((is_today & (mins >= 240) & (mins < 570)).sum())
+    if pm_n >= MIN_PM_BARS:
+        return df[is_today & (mins >= 240) & (mins <= 960)], True, pm_n
+    return df[is_today & (mins >= 570) & (mins <= 960)], False, pm_n
+
+
+def redline_angle(fr):
+    """Red-line angle over the last REDLINE_ANGLE_BARS minutes (degrees): rise as % of price, per minute."""
+    if math.isnan(fr.red_now) or math.isnan(fr.red_prev3) or not fr.close or fr.close <= 0:
+        return float("nan")
+    rise_pct = (fr.red_now - fr.red_prev3) / fr.close * 100.0
+    return float(math.degrees(math.atan(rise_pct / REDLINE_ANGLE_BARS)))
+
+
+def redline_buy(fr):
+    """Returns the red-line angle if the RED-LINE BUY rule holds on this bar, else None."""
+    a = redline_angle(fr)
+    if math.isnan(a) or math.isnan(fr.black_now) or math.isnan(fr.angle_now):
+        return None
+    if not (fr.red_now > fr.red_prev):
+        return None
+    if not (fr.red_now < fr.black_now):
+        return None
+    if fr.angle_now <= REDLINE_BLACK_GATE:
+        return None
+    if a < REDLINE_MIN_ANGLE:
+        return None
+    return a
+
+
+def strength_word(a):
+    return "STRONG" if a >= STRONG_ANGLE else "MEDIUM" if a >= MEDIUM_ANGLE else "WEAK"
+
+
+ALERT_LOG_COLUMNS = ["date", "time_az", "ticker", "kind", "strength", "redline_angle",
+                     "price_angle", "black_angle", "price", "shown", "note"]
+
+
+def append_alert_row(row):
+    new = not os.path.exists(ALERT_LOG_CSV)
+    with open(ALERT_LOG_CSV, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=ALERT_LOG_COLUMNS)
+        if new:
+            w.writeheader()
+        w.writerow({k: row.get(k, "") for k in ALERT_LOG_COLUMNS})
+
+
+def premarket_check(api):
+    now_et = et_now()
+    if now_et.weekday() >= 5:
+        return
+    log(f"PREMARKET CHECK: asking TradeStation for bars with sessiontemplate={SESSION_TEMPLATE}")
+    ok = 0
+    for sym in SYMBOLS:
+        try:
+            raw = api.get_bars(sym)
+            if raw is None:
+                log(f"PREMARKET CHECK {sym}: no bars returned")
+                continue
+            _, _, pm = prepare_today(raw, now_et)
+            log(f"PREMARKET CHECK {sym}: {pm} pre-market bars today"
+                + ("" if pm >= MIN_PM_BARS else f"  <-- fewer than {MIN_PM_BARS}: this stock will use lines from 9:30 instead"))
+            ok += pm >= MIN_PM_BARS
+        except Exception as e:
+            log(f"PREMARKET CHECK {sym}: ERROR {e}")
+    log(f"PREMARKET CHECK done: {ok} of {len(SYMBOLS)} stocks have at least {MIN_PM_BARS} pre-market bars "
+        f"(before about 4:00 AM ET there are none yet)")
+
+
 def et_now():
     return datetime.now(ET)
 
@@ -797,62 +912,84 @@ skipped_turnup = {}   # symbol -> date string, set when you skip/let expire a RE
 pending_buy_meta = {} # symbol -> indicator snapshot at signal time, held until you approve/skip the buy
 
 
-class TerminalApproval:
-    """Plain-text sell approval, right here in this terminal (no popup window,
-    since this runs headless over SSH with no screen attached)."""
+live_alerts = {}      # symbol -> dict(num, kind, text, price, t0)  -- the numbered BUY ALERT list
+alert_counter = [0]   # numbers only go up during a run, never reused
+live_lock = threading.Lock()
 
-    @staticmethod
-    def _read_line_with_timeout(prompt, timeout_sec):
-        result_q = queue.Queue()
 
-        def _reader():
-            try:
-                line = input(prompt)
-            except EOFError:
-                return
-            result_q.put(line)
+def az_clock():
+    return datetime.now(AZ).strftime("%I:%M %p").lstrip("0")
 
-        t = threading.Thread(target=_reader, daemon=True)
-        t.start()
+
+def show_alert_list():
+    with live_lock:
+        items = sorted(live_alerts.items(), key=lambda kv: kv[1]["num"])
+    if not items:
+        return
+    lines = ["", "", f"BUY ALERT   {az_clock()}"]
+    for sym, a in items:
+        lines.append(f"    {a['num']}   {sym}: {a['text']}")
+    lines.append("To buy: type the number, press Enter.")
+    print("\n".join(lines), flush=True)
+
+
+def handle_buy_number(api, n):
+    with live_lock:
+        found = next(((sym, a) for sym, a in live_alerts.items() if a["num"] == n), None)
+    if found is None:
+        print(f"{n}: not on the BUY ALERT list any more.", flush=True)
+        return
+    sym, a = found
+    if past(et_now(), NO_NEW_AFTER_ET):
+        print(f"No new buys after 12:58 PM Arizona -- not buying {sym}.", flush=True)
+        return
+    if sym in open_positions or sym in pending_buy_meta:
+        print(f"{sym}: already holding.", flush=True)
+        return
+    if slots_in_use() >= MAX_SLOTS:
+        print(f"Slots full ({MAX_SLOTS} positions) -- not buying {sym}.", flush=True)
+        return
+    if pair_leg_open(sym):
+        print(f"{sym}: its partner {PARTNER.get(sym)} is already open -- not buying {sym}.", flush=True)
+        return
+    try:
+        price = float(api.get_latest_trade(sym).price)
+        if price <= 0:
+            price = a["price"]
+    except Exception:
+        price = a["price"]
+    fr = latest_frame.get(sym)
+    pending_buy_meta[sym] = {
+        "entry_angle_now": fr.angle_now if fr else "",
+        "entry_angle_was": "",
+        "label": a["text"],
+    }
+    with live_lock:
+        live_alerts.pop(sym, None)
+    log(f"YOU TYPED {n}: buying {sym} ({a['text']}) at ~{price:.4f}")
+    decision_queue.put(("APPROVE_BUY", sym, price, None))
+
+
+def buy_input_worker(api):
+    """Reads what you type. A number (or several, separated by spaces) buys that stock from the list."""
+    while _RUNNING:
         try:
-            return result_q.get(timeout=timeout_sec)
-        except queue.Empty:
-            return None
-
-    def run_forever(self):
-        while _RUNNING:
+            line = input()
+        except EOFError:
+            return
+        except Exception:
+            time.sleep(1)
+            continue
+        for tok in re.split(r"[,\s]+", line.strip()):
+            if not tok:
+                continue
+            if not tok.isdigit():
+                print(f"'{tok}' is not a number from the BUY ALERT list. Nothing bought.", flush=True)
+                continue
             try:
-                symbol, price, ts, kind, reason = approval_queue.get(timeout=1)
-            except queue.Empty:
-                continue
-
-            if kind == "BUY":
-                label, _, detail = str(reason).partition("||")
-                header = f"{label} -- BUY SIGNAL -- {symbol} @ ~${price:.2f}"
-                if detail:
-                    header += "\n" + detail
-                ask = "Type Y and press Enter to BUY, or just press Enter to skip."
-            else:
-                header = f"SELL SIGNAL -- {symbol} @ ~${price:.2f}  ({reason})"
-                ask = "Type Y and press Enter to SELL, or just press Enter to keep holding."
-
-            banner = (
-                f"\n{'='*60}\n{header}\n{'='*60}\n{ask}\n"
-                f"(you have {POPUP_TIMEOUT_SECONDS} seconds -- after that it auto-"
-                f"{'skips' if kind=='BUY' else 'expires (stays held)'})\n> "
-            )
-
-            answer = self._read_line_with_timeout(banner, POPUP_TIMEOUT_SECONDS)
-
-            if answer is None:
-                decision_queue.put((f"EXPIRED_{kind}", symbol, price, ts))
-                print(f"(no answer in time -- {symbol} {kind} EXPIRED)")
-                continue
-
-            if answer.strip().lower() in ("y", "yes"):
-                decision_queue.put((f"APPROVE_{kind}", symbol, price, ts))
-            else:
-                decision_queue.put((f"SKIP_{kind}", symbol, price, ts))
+                handle_buy_number(api, int(tok))
+            except Exception as e:
+                log(f"ERROR handling buy number {tok}: {e}")
 
 
 def steep_cross_up(fr):
@@ -879,37 +1016,41 @@ def pair_leg_open(sym):
 
 
 def signal_worker(api):
-    """Watches every symbol, asks for your approval the instant the 2-part
-    signal fires -- black line's current angle is shallow enough, AND the
-    red line is rising 2 bars in a row, both true on the SAME bar
-    (2026-08-31, Gary's decision: RSI dropped entirely -- extensive
-    testing found it added no real predictive value, mostly just delay).
-    No arm-tracking or multi-bar alignment window needed now that there
-    are only two conditions to check, and they're required
-    simultaneously."""
-    last_signaled_bar = {s: None for s in SYMBOLS}
-    alert_armed = {s: True for s in SYMBOLS}   # B2: one alert per run
+    """Every poll: rebuild the lines for each stock, then
+       - RED-LINE BUY: red-line angle over 3 min >= 13, red still rising, red below black, black angle > -35
+       - CROSS-UP BUY: red crosses up through black, price angle >= 30, black angle > -15 (unchanged)
+    New alerts go on the numbered BUY ALERT list (at most 3 new per minute, strongest first)."""
     last_cross_bar = {}
+    processed_bar = {}
+    alert_armed = {s: True for s in SYMBOLS}
+    last_alert_idx = {}
+    shown_by_minute = {}
     stale_logged = set()
+    mode_logged = set()
 
-    log(f"Signal worker started. Black-line check: current angle must be above "
-        f"{SHALLOWED:.1f} degrees. Red line still rising now, with "
-        f"MIN_BEND_PCT={MIN_BEND_PCT:.2f}% over {BEND_LOOKBACK_BARS} bars. "
-        f"Red must be BELOW black; stale-bar guard {STALE_BAR_MINUTES} min; one prompt per signal run. "
-        f"MAX_SLOTS={MAX_SLOTS}, pair-lock ON.")
+    log(f"Signal worker started. RED-LINE BUY: red-line angle over {REDLINE_ANGLE_BARS} min >= {REDLINE_MIN_ANGLE:.0f} deg "
+        f"(STRONG>={STRONG_ANGLE:.0f}, MEDIUM>={MEDIUM_ANGLE:.0f}), red still rising, red below black, black angle > {REDLINE_BLACK_GATE:.0f}. "
+        f"CROSS-UP BUY: price angle >= {CROSS_MIN_ANGLE:.0f}, black angle > {SHALLOWED:.0f}. "
+        f"Max {MAX_NEW_PER_MINUTE} new alerts per minute; list keeps an alert at least {ALERT_MIN_MINUTES} and at most {ALERT_LIST_MAX_MINUTES} min. "
+        f"MAX_SLOTS={MAX_SLOTS}, pair-lock ON, no new alerts after {NO_NEW_AFTER_ET} ET.")
 
     while _RUNNING:
         now_et = et_now()
         if not in_session(now_et):
             time.sleep(POLL_SECONDS)
             continue
+        new_ok = not past(now_et, NO_NEW_AFTER_ET)
+        changed = False
+        candidates = []
 
         for sym in SYMBOLS:
             held = sym in open_positions
             try:
-                df = api.get_bars(sym)
-                df = session_filter(df) if df is not None else None
-                if df is None or len(df) < WARMUP_BARS + ANGLE_LOOKBACK + 35:
+                raw = api.get_bars(sym)
+                if raw is None:
+                    continue
+                df, used_pm, pm_n = prepare_today(raw, now_et)
+                if df is None or len(df) < WARMUP_BARS + 1:
                     continue
                 fr = build_frame(df)
                 latest_frame[sym] = fr   # cache for the live status board
@@ -917,7 +1058,11 @@ def signal_worker(api):
                 log(f"WARN {sym}: {e}")
                 continue
 
-            # B2: ignore bars that are not from today or are stale (see header)
+            if sym not in mode_logged:
+                mode_logged.add(sym)
+                log(f"LINES {sym}: " + (f"built from pre-market bars ({pm_n} pre-market bars today)" if used_pm
+                    else f"built from 9:30 ET (only {pm_n} pre-market bars today, need {MIN_PM_BARS})"))
+
             try:
                 last_bar_et = pd.Timestamp(fr.ts).tz_convert(ET)
                 bar_age_min = (now_et - last_bar_et).total_seconds() / 60.0
@@ -929,83 +1074,104 @@ def signal_worker(api):
                     log(f"STALE-SKIP {sym}: newest bar is {last_bar_et.strftime('%Y-%m-%d %H:%M')} ET "
                         f"({bar_age_min:.1f} min old) -- waiting for fresh bars from today")
                 continue
-
             if fr.bar_index < WARMUP_BARS:
                 continue
 
-            # ---- 2026-10-20: STEEP CROSS-UP alert (second alert) ----
-            cross_key = (str(now_et.date()), fr.bar_index)
-            if steep_cross_up(fr) and last_cross_bar.get(sym) != cross_key:
-                last_cross_bar[sym] = cross_key
-                cross_line = (f"Price angle: {fr.red_angle:.0f} deg   "
-                              f"Black line angle: {fr.angle_now:+.1f} deg")
-                if held:
-                    print(f"\nALREADY HOLDING -- STEEP CROSS-UP on {sym} @ ~${fr.close:.2f}\n"
-                          f"{cross_line}\n"
-                          f"You bought this stock at the red turn-up. No action needed.\n", flush=True)
-                    log(f"ALREADY-HOLDING {sym} steep cross-up @ {fr.close:.4f} angle={fr.red_angle:.0f}")
-                elif sym in pending_buy_meta:
-                    log(f"CROSS-UP-NOTE {sym}: a question for this stock is already open -- not asking twice")
-                elif slots_in_use() >= MAX_SLOTS:
-                    log(f"SLOT-SKIP {sym} steep cross-up (slots full {MAX_SLOTS})")
-                elif pair_leg_open(sym):
-                    log(f"PAIR-SKIP {sym} steep cross-up (partner {PARTNER[sym]} already open)")
-                else:
-                    detail = cross_line
-                    if skipped_turnup.get(sym) == str(now_et.date()):
-                        detail += "\nYou skipped the earlier red turn-up on this stock."
-                    log(f"SIGNAL STEEP-CROSS-UP {sym} @ {fr.close:.4f} bar={fr.bar_index} "
-                        f"price-angle={fr.red_angle:.0f} black-angle={fr.angle_now:+.1f} -- ASKING FOR YOUR APPROVAL "
-                        f"(~{shares_for_dollars(fr.close)} shares, ~${TRADE_DOLLARS} notional)")
-                    pending_buy_meta[sym] = {
-                        "entry_angle_now": fr.angle_now,
-                        "entry_angle_was": fr.angle_was,
-                        "label": "STEEP CROSS-UP",
-                    }
-                    approval_queue.put((sym, fr.close, None, "BUY", "STEEP CROSS-UP||" + detail))
+            a3 = redline_buy(fr)
+            bar_key = str(fr.ts)
+            is_cross = steep_cross_up(fr) and last_cross_bar.get(sym) != bar_key
+            entry = live_alerts.get(sym)
+
             if held:
+                if entry is not None:
+                    with live_lock:
+                        live_alerts.pop(sym, None)
+                    changed = True
+                if is_cross:
+                    last_cross_bar[sym] = bar_key
+                    print(f"\n{sym}: already holding\n", flush=True)
+                    log(f"ALREADY-HOLDING {sym} cross-up @ {fr.close:.4f}")
                 continue
 
-            # 2026-10-15: same conditions as Engine A (RSI-dip requirement removed)
-            # B2 BELOW-BLACK (2026-10-13, Gary's decision): only alert when the red
-            # line (HMA7) is BELOW the black line (EMA20). Red well above black
-            # is more likely overbought, and several of those alerts on 10/13
-            # morning were not good. History test (1,984 ticker-days): red-below-
-            # black alerts reached +1% in 10 min 44% of the time vs 38% above.
-            red_below_black = (not math.isnan(fr.black_now)) and fr.red_now < fr.black_now
-            if not (black_gate_open(fr) and red_rising(fr) and red_below_black):
-                alert_armed[sym] = True   # conditions ended; the next time they hold is a NEW alert
-                continue
-            if not alert_armed[sym]:
-                continue   # same run as an alert already raised -- do not ask again
-            alert_armed[sym] = False
+            if is_cross:
+                last_cross_bar[sym] = bar_key
+                if entry is not None:
+                    entry["kind"] = "CROSS"
+                    entry["text"] = "CROSS-UP BUY"
+                    entry["t0"] = time.time()
+                    changed = True
+                    log(f"ALERT-UPGRADE {sym}: red-line alert is now a CROSS-UP BUY @ {fr.close:.4f}")
+                    append_alert_row({"date": str(now_et.date()), "time_az": az_clock(), "ticker": sym,
+                                      "kind": "CROSS-UP", "price_angle": f"{fr.red_angle:.0f}",
+                                      "black_angle": f"{fr.angle_now:+.1f}", "price": f"{fr.close:.4f}",
+                                      "shown": "Y", "note": "upgrade of a listed red-line alert"})
+                elif new_ok:
+                    candidates.append({"sym": sym, "kind": "CROSS", "score": 100.0 + fr.red_angle,
+                                       "fr": fr, "a3": a3, "minute": bar_key, "word": ""})
+            elif entry is not None:
+                age_min = (time.time() - entry["t0"]) / 60.0
+                if entry["kind"] == "RED":
+                    ended = a3 is None
+                else:
+                    ended = not (fr.red_now > fr.black_now and fr.red_now > fr.red_prev)
+                if (ended and age_min >= ALERT_MIN_MINUTES) or age_min > ALERT_LIST_MAX_MINUTES:
+                    with live_lock:
+                        live_alerts.pop(sym, None)
+                    changed = True
+                    log(f"ALERT-ENDED {sym} ({'signal ended' if ended else 'listed over %d min' % ALERT_LIST_MAX_MINUTES})")
+            else:
+                if a3 is None:
+                    alert_armed[sym] = True
+                elif (alert_armed[sym] and new_ok and processed_bar.get(sym) != bar_key
+                      and fr.bar_index - last_alert_idx.get(sym, -999) >= REALERT_COOLDOWN_BARS):
+                    processed_bar[sym] = bar_key
+                    alert_armed[sym] = False
+                    candidates.append({"sym": sym, "kind": "RED", "score": a3, "fr": fr, "a3": a3,
+                                       "minute": bar_key, "word": strength_word(a3)})
 
-            sig_key = (str(now_et.date()), fr.bar_index)
-            if last_signaled_bar[sym] == sig_key:
-                continue
-            last_signaled_bar[sym] = sig_key
+        # ---- decide which new alerts to show (strongest first, at most MAX_NEW_PER_MINUTE per minute)
+        by_min = {}
+        for c in candidates:
+            by_min.setdefault(c["minute"], []).append(c)
+        for minute, lst in by_min.items():
+            lst.sort(key=lambda c: -c["score"])
+            room = MAX_NEW_PER_MINUTE - shown_by_minute.get(minute, 0)
+            shown_now = 0
+            for c in lst:
+                sym, fr = c["sym"], c["fr"]
+                base = {"date": str(now_et.date()), "time_az": az_clock(), "ticker": sym,
+                        "kind": "CROSS-UP" if c["kind"] == "CROSS" else "RED-LINE",
+                        "strength": c["word"],
+                        "redline_angle": "" if c["a3"] is None else f"{c['a3']:.1f}",
+                        "price_angle": "" if math.isnan(fr.red_angle) else f"{fr.red_angle:.0f}",
+                        "black_angle": f"{fr.angle_now:+.1f}", "price": f"{fr.close:.4f}"}
+                if slots_in_use() >= MAX_SLOTS:
+                    log(f"SLOT-SKIP {sym} (slots full {MAX_SLOTS})")
+                    append_alert_row({**base, "shown": "N", "note": "slots full"})
+                    continue
+                if pair_leg_open(sym):
+                    log(f"PAIR-SKIP {sym} (partner {PARTNER[sym]} already open)")
+                    append_alert_row({**base, "shown": "N", "note": "pair lock"})
+                    continue
+                if shown_now >= room:
+                    log(f"LOGGED-ONLY {sym} {base['kind']} {c['word']} (more than {MAX_NEW_PER_MINUTE} new alerts this minute)")
+                    append_alert_row({**base, "shown": "N", "note": "cap per minute"})
+                    continue
+                alert_counter[0] += 1
+                text = f"RED-LINE BUY {c['word']}" if c["kind"] == "RED" else "CROSS-UP BUY"
+                with live_lock:
+                    live_alerts[sym] = {"num": alert_counter[0], "kind": c["kind"], "text": text,
+                                        "price": fr.close, "t0": time.time()}
+                shown_now += 1
+                last_alert_idx[sym] = fr.bar_index
+                changed = True
+                log(f"ALERT #{alert_counter[0]} {sym} {text} @ {fr.close:.4f} redline-angle={base['redline_angle']} "
+                    f"price-angle={base['price_angle']} black-angle={fr.angle_now:+.1f}")
+                append_alert_row({**base, "shown": "Y", "note": ""})
+            shown_by_minute[minute] = shown_by_minute.get(minute, 0) + shown_now
 
-            # ---- safety protections, ported from the plain system ----
-            if slots_in_use() >= MAX_SLOTS:
-                log(f"SLOT-SKIP {sym} (slots full {MAX_SLOTS})")
-                continue
-            if pair_leg_open(sym):
-                log(f"PAIR-SKIP {sym} (partner {PARTNER[sym]} already open)")
-                continue
-
-            log(f"SIGNAL RED-TURN-UP {sym} @ {fr.close:.4f} bar={fr.bar_index} "
-                f"angle={fr.angle_now:+.1f} red-vs-black={(fr.red_now/fr.black_now-1)*100:+.2f}% -- ASKING FOR YOUR APPROVAL "
-                f"(double-cyborg mode, ~{shares_for_dollars(fr.close)} shares, "
-                f"~${TRADE_DOLLARS} notional)")
-            pending_buy_meta[sym] = {
-                "entry_angle_now": fr.angle_now,
-                "entry_angle_was": fr.angle_was,
-                "label": "RED TURN-UP",
-            }
-            approval_queue.put((sym, fr.close, None, "BUY", "RED TURN-UP||"
-                f"Black line angle: {fr.angle_now:+.1f} deg   "
-                f"Red vs black: {(fr.red_now/fr.black_now-1)*100:+.1f}%"))
-
+        if changed:
+            show_alert_list()
         time.sleep(POLL_SECONDS)
 
 
@@ -1211,6 +1377,10 @@ def decision_worker(api):
             try:
                 result = api.market_buy(symbol, qty)
                 log(f"Buy order result for {symbol}: {result} ({qty} shares @ ${price:.2f})")
+                if api.dry_run:
+                    print(f"BOUGHT {symbol}: {qty} shares @ ~${price:.2f}  *** TEST MODE (DRY_RUN is ON): NO REAL ORDER WAS SENT ***", flush=True)
+                else:
+                    print(f"BOUGHT {symbol}: {qty} shares @ ~${price:.2f}  -- real order sent", flush=True)
                 meta = pending_buy_meta.pop(symbol, {})
                 open_positions[symbol] = {
                     "entry": price, "peak": price, "qty": qty,
@@ -1222,6 +1392,7 @@ def decision_worker(api):
                     f"will alert on sell via this terminal")
             except Exception as e:
                 log(f"ERROR buying {symbol}: {e}")
+                print(f"BUY FAILED for {symbol}: {e}", flush=True)
                 pending_buy_meta.pop(symbol, None)
         elif action == "SKIP_BUY":
             log(f"SKIPPED by you: {symbol} @ ~{price} -- not buying this signal")
@@ -1277,12 +1448,15 @@ def main():
 
     bal = api.get_balance()
     log("=" * 70)
-    log("RSI MOD2 -- ENGINE B (Double Cyborg, self-contained file)")
+    log("RSI MOD2 -- ENGINE B REDLINE (you look, then you decide; self-contained file)")
     log("=" * 70)
     if bal:
         log(f"BALANCE  equity=${bal['equity']:,.2f}  cash=${bal['cash']:,.2f}")
         if api.env == "live" and not api.dry_run:
             log("         ^ CHECK THIS ACCOUNT. Ctrl-C now if it is wrong.")
+    log(f"REDLINE  angle over {REDLINE_ANGLE_BARS} min >= {REDLINE_MIN_ANGLE:.0f}  STRONG>={STRONG_ANGLE:.0f} MEDIUM>={MEDIUM_ANGLE:.0f}  "
+        f"BLACK_GATE>{REDLINE_BLACK_GATE:.0f}  MAX_NEW_PER_MINUTE={MAX_NEW_PER_MINUTE}  LIST_MAX_MIN={ALERT_LIST_MAX_MINUTES}  "
+        f"NO_NEW_AFTER={NO_NEW_AFTER_ET} ET  ALERT_LOG={ALERT_LOG_CSV}")
     log(f"MODE     {RSI_MOD2_MODE}  |  SHALLOWED={SHALLOWED:.1f}  "
         f"MIN_BEND_PCT={MIN_BEND_PCT:.2f}% over {BEND_LOOKBACK_BARS} bars  "
         f"STOP_PCT={STOP_PCT:.1f}%  TRAIL_PCT={TRAIL_PCT:.1f}%  "
@@ -1296,9 +1470,11 @@ def main():
     log("Watching quietly now -- will only print again when a real signal, "
         "buy, sell, or heartbeat happens. This is normal; no news is good news.")
 
-    ui = TerminalApproval()
+    premarket_check(api)
+    print("\nHOW TO BUY: when a BUY ALERT list appears, type the number next to the stock and press Enter.\n"
+          "Do nothing to skip. Nothing is ever bought unless you type a number.\n", flush=True)
 
-    threading.Thread(target=ui.run_forever, daemon=True).start()
+    threading.Thread(target=buy_input_worker, args=(api,), daemon=True).start()
     threading.Thread(target=signal_worker, args=(api,), daemon=True).start()
     threading.Thread(target=sell_monitor_worker, args=(api,), daemon=True).start()
     threading.Thread(target=reconcile_positions_worker, args=(api,), daemon=True).start()
