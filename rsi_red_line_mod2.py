@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
+CHANGED 2026-11-02 (Gary's decision): STOCKS CUT FROM 17 TO 12. Taken out: APLX, RKLX, SMCX (longs) and IREZ, NBIZ (shorts).
+    ALSO 2026-11-02: TRADE_DOLLARS raised from $1000 to $2500 per buy (4 positions at most = about $10,000 at once).
+    NBIZ was taken out because its bid/ask spread was about $1.20, far wider than the others.
+    NOW 12 STOCKS: longs AAOX ASTX BEX CWVX IRE NBIL SNXX SOXL (8); shorts BEZ CORD SNDQ SOXS (4).
+    Pair lock: BEX/BEZ, CWVX/CORD, SNXX/SNDQ, SOXL/SOXS. Singles: AAOX ASTX IRE NBIL (IRE lost IREZ, NBIL lost NBIZ).
+    NOTHING ELSE CHANGED: every rule below (signals, cost filter, stops, times) is exactly as in c3bf7b0b.
+    (The text under "1. STOCKS (17)" below is the OLD list, kept for history.)
 CHANGED 2026-10-27 (Gary's decision) -- THIS FILE: rsi_engineA_redline_auto.py
     ENGINE A, NEW VERSION. Built from rsi_engineB_redline.py (92cc70ff). It uses the same signals as Engine B;
-    the difference is WHO BUYS: this engine buys by itself, $1000 per buy. Typing in its window does nothing.
+    the difference is WHO BUYS: this engine buys by itself, $2500 per buy (was $1000 until 2026-11-02). Typing in its window does nothing.
     1. STOCKS (17): longs AAOX APLX ASTX BEX CWVX IRE NBIL RKLX SMCX SNXX SOXL; shorts BEZ CORD IREZ NBIZ SNDQ SOXS.
        Pair lock: BEX/BEZ, CWVX/CORD, IRE/IREZ, NBIL/NBIZ, SNXX/SNDQ, SOXL/SOXS. Singles: AAOX APLX ASTX RKLX SMCX.
     2. LINES use pre-market bars (04:00 ET on; a stock with fewer than 10 pre-market bars uses lines from 9:30).
@@ -19,9 +26,9 @@ CHANGED 2026-10-27 (Gary's decision) -- THIS FILE: rsi_engineA_redline_auto.py
     5. After ANY sale of a stock (including a sale you make by hand) the engine will not buy that stock again for
        REBUY_WAIT_MIN (10) minutes (REBUY-WAIT in the log).
     6. No new buys after 15:30 ET (30 minutes before the close: 12:30 PM Arizona now, 1:30 PM after Nov 1).
-       Sells unchanged: -2% stop, 2.5% trailing stop, flat at 15:59 ET. $1000 per buy, at most 4 positions.
+       Sells unchanged: -2% stop, 2.5% trailing stop, flat at 15:59 ET. $2500 per buy, at most 4 positions.
     7. STATUS BOARD: LONGS and SHORTS in two groups; "rl=" is the red line's 3-minute angle (a red-line buy needs 18+);
-       summary line "Red up: LONGS n of 11, SHORTS n of 6".
+       summary line "Red up: LONGS n of 8, SHORTS n of 4" (was 11 and 6 with 17 stocks).
     8. LOGS: rsi_engineA_redline_log.csv (trades; new column "signal" says which signal bought it) and
        engineA_alerts_log.csv (every signal, bought or skipped, with strength, angles, price, note).
     9. STARTUP prints QUOTE CHECK lines (last, bid, ask, cost) for SOXL, NBIL, BEX. If they show no bid/ask, tell Claude/Gary.
@@ -318,7 +325,7 @@ CROSS_RED_POINTS = 4          # points used for the best-fit angle (price closes
                               # buy prompt in this long,
                                # it auto-expires and keeps holding
 
-TRADE_DOLLARS = 1000  # CHANGED 2026-10-27 (Gary): $1000 per trade for Engine A. Older note: CHANGED 2026-10-15 (Gary): $500 per trade on both engines. (Was 200.) Older note follows: CHANGED 2026-10-15 (Gary): $200 per trade, matches Engine A. Was 500; RAISED (2026-09-21 night, Gary's decision): was $1
+TRADE_DOLLARS = 2500  # CHANGED 2026-11-02 (Gary): $2500 per trade (was $1000). Older: CHANGED 2026-10-27 (Gary): $1000 per trade for Engine A. Older note: CHANGED 2026-10-15 (Gary): $500 per trade on both engines. (Was 200.) Older note follows: CHANGED 2026-10-15 (Gary): $200 per trade, matches Engine A. Was 500; RAISED (2026-09-21 night, Gary's decision): was $1
                      # (forcing 1 share/trade) for the very first live test
                      # of this rewritten signal (0-degree angle filter,
                      # 1.25% bend over 3 min). Gary's own reasoning: "I
@@ -363,9 +370,9 @@ RSI_MOD2_MODE = "FULLY_AUTOMATIC"  # Engine A: buys and sells by itself
 # while trade quality is the same or slightly BETTER (avg peak
 # actually improved, from 6.55% to 7.27%, in the smaller group).
 PAIRS = [
-    ("AAOX",), ("APLX",), ("ASTX",), ("RKLX",), ("SMCX",),
-    ("BEX", "BEZ"), ("CWVX", "CORD"), ("IRE", "IREZ"), ("NBIL", "NBIZ"), ("SNXX", "SNDQ"), ("SOXL", "SOXS"),
-]  # 2026-10-27 (Gary): 17 stocks. Pair lock only where a stock has an inverse partner here.
+    ("AAOX",), ("ASTX",), ("IRE",), ("NBIL",),
+    ("BEX", "BEZ"), ("CWVX", "CORD"), ("SNXX", "SNDQ"), ("SOXL", "SOXS"),
+]  # 2026-11-02 (Gary): 12 stocks (was 17; APLX RKLX SMCX IREZ NBIZ out). Pair lock only where a stock has an inverse partner here.
 SYMBOLS = sorted(s for pr in PAIRS for s in pr)   # alphabetical: the status board reads in this order
 PARTNER = {}
 for _grp in PAIRS:
@@ -1345,7 +1352,7 @@ def signal_worker(api):
 
 
 STATUS_BOARD_SECONDS = 60   # how often the live status board prints
-SHORT_SYMBOLS = ("BEZ", "CORD", "IREZ", "NBIZ", "SNDQ", "SOXS")
+SHORT_SYMBOLS = ("BEZ", "CORD", "SNDQ", "SOXS")
 LONG_SYMBOLS = tuple(s for s in SYMBOLS if s not in SHORT_SYMBOLS)
 
 
