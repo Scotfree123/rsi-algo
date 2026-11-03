@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
+CHANGED 2026-11-02 evening (Gary's decision) -- THIS FILE: rsi_engineB_redline_same.py
+    ENGINE B, REBUILT AS A COPY OF ENGINE A (3-slot build of rsi_engineA_redline_auto.py). THE ONLY DIFFERENCE: WHO BUYS.
+    Engine A buys by itself. Engine B shows a BUY ALERT list and YOU TYPE THE NUMBER and press Enter to buy.
+    Same as Engine A: the 12 stocks, red-line buy at 18+ (WEAK 13-18 is no longer shown; set B_MIN_ANGLE=13 to bring it back),
+    cross-up buy, all gates, pair lock, 3 positions, $2500 per buy, 10-minute re-buy wait, no new buys after 15:30 ET,
+    -2% stop, 2.5% trail, flat 15:59 ET (selling is automatic in both engines), pre-market lines, near-miss logging,
+    QUOTE CHECK at start-up, status board.
+    B-only: every alert line shows the spread cost; the 0.5% cost filter does NOT block a buy in B (you decide; WIDE is printed if above 0.5%).
+    Log files: rsi_engineB_redline_log.csv and engineB_alerts_log.csv.
+CHANGED 2026-11-02 evening (Gary's decision): MAX_SLOTS 4 -> 3. At most 3 positions open at once (about $7,500 at $2500 each).
+    A 4th signal while 3 are held is skipped and logged ("SLOT-SKIP ... slots full 3"; alerts file note "slots full"). Nothing else changed.
 CHANGED 2026-11-02 (Gary's decision): STOCKS CUT FROM 17 TO 12. Taken out: APLX, RKLX, SMCX (longs) and IREZ, NBIZ (shorts).
-    ALSO 2026-11-02: TRADE_DOLLARS raised from $1000 to $2500 per buy (4 positions at most = about $10,000 at once).
+    ALSO 2026-11-02: TRADE_DOLLARS raised from $1000 to $2500 per buy (was 4 positions = about $10,000; now 3 positions = about $7,500).
     NBIZ was taken out because its bid/ask spread was about $1.20, far wider than the others.
     NOW 12 STOCKS: longs AAOX ASTX BEX CWVX IRE NBIL SNXX SOXL (8); shorts BEZ CORD SNDQ SOXS (4).
     Pair lock: BEX/BEZ, CWVX/CORD, SNXX/SNDQ, SOXL/SOXS. Singles: AAOX ASTX IRE NBIL (IRE lost IREZ, NBIL lost NBIZ).
@@ -26,7 +37,7 @@ CHANGED 2026-10-27 (Gary's decision) -- THIS FILE: rsi_engineA_redline_auto.py
     5. After ANY sale of a stock (including a sale you make by hand) the engine will not buy that stock again for
        REBUY_WAIT_MIN (10) minutes (REBUY-WAIT in the log).
     6. No new buys after 15:30 ET (30 minutes before the close: 12:30 PM Arizona now, 1:30 PM after Nov 1).
-       Sells unchanged: -2% stop, 2.5% trailing stop, flat at 15:59 ET. $2500 per buy, at most 4 positions.
+       Sells unchanged: -2% stop, 2.5% trailing stop, flat at 15:59 ET. $2500 per buy, at most 3 positions.
     7. STATUS BOARD: LONGS and SHORTS in two groups; "rl=" is the red line's 3-minute angle (a red-line buy needs 18+);
        summary line "Red up: LONGS n of 8, SHORTS n of 4" (was 11 and 6 with 17 stocks).
     8. LOGS: rsi_engineA_redline_log.csv (trades; new column "signal" says which signal bought it) and
@@ -298,7 +309,7 @@ SELL_ALERT_COOLDOWN_SECONDS = 90
 POPUP_TIMEOUT_SECONDS = 45    # CHANGED 2026-10-20 (Gary): 45 s. (2026-09-03: 180 s; was 600)
 CROSS_MIN_ANGLE = 30.0        # 2026-10-21: steep cross-up alert needs PRICE angle >= this (degrees)
 REDLINE_ANGLE_BARS = 3        # 2026-10-25: red-line rise is measured over this many minutes
-REDLINE_MIN_ANGLE = float(os.getenv("A_MIN_ANGLE") or 18.0)   # degrees over 3 min; ENGINE A buys only at/above this (B alerts at 13)
+REDLINE_MIN_ANGLE = float(os.getenv("B_MIN_ANGLE") or os.getenv("A_MIN_ANGLE") or 18.0)   # degrees over 3 min; ENGINE A buys only at/above this (B alerts at 13)
 STRONG_ANGLE = 25.0           # strength words, same angle
 MEDIUM_ANGLE = 18.0
 REDLINE_BLACK_GATE = -35.0    # black-line 10-minute angle must be above this for a RED-LINE BUY
@@ -308,8 +319,8 @@ MAX_NEW_PER_MINUTE = 3        # at most this many NEW alerts shown per minute (s
 REALERT_COOLDOWN_BARS = 10    # same stock cannot get a new red-line alert sooner than this many bars
 MIN_PM_BARS = 10              # fewer pre-market bars than this today -> that stock uses lines from 9:30
 SESSION_TEMPLATE = "USEQPreAndPost"
-ALERT_LOG_CSV = os.getenv("ALERT_LOG_CSV") or "engineA_alerts_log.csv"
-AUTO_BUY = True                                  # Engine A buys by itself
+ALERT_LOG_CSV = os.getenv("ALERT_LOG_CSV") or "engineB_alerts_log.csv"
+AUTO_BUY = False                                 # Engine B: YOU type the number to buy
 COST_FILTER = (os.getenv("COST_FILTER") or "1") != "0"
 COST_MAX_PCT = float(os.getenv("COST_MAX_PCT") or 0.5)   # skip a buy if (ask-bid)/midpoint is above this percent
 CARRY_ON = (os.getenv("CARRY_ON") or "0") != "0"   # OFF by decision (Gary 2026-10-27)
@@ -347,15 +358,15 @@ def shares_for_dollars(price: float) -> int:
         return 1
     return max(1, int(TRADE_DOLLARS / price))
 
-MAX_SLOTS = 4    # CHANGED 2026-10-15 (Gary): matches Engine A. Never more than 4 positions open
-                 # (positions held PLUS buys waiting for your answer count toward the 4).
+MAX_SLOTS = 3    # CHANGED 2026-11-02 (Gary): 3 positions at most (was 4). Same in Engine A and Engine B.
+                 # (positions held PLUS buys waiting for your answer count toward the 3).
 STALE_BAR_MINUTES = 4   # 2026-10-15: newest bar must be from today and no older than this many minutes
 
 RSI_LEN = 7                 # B2: RSI period (Wilder), computed from today's bars only
 RSI_DIP_LEVEL = 30.0        # B2: RSI must have been at or below this recently
 RSI_DIP_LOOKBACK_BARS = 15  # B2: ...within this many minutes (including now)
 
-RSI_MOD2_MODE = "FULLY_AUTOMATIC"  # Engine A: buys and sells by itself
+RSI_MOD2_MODE = "ALERT_THEN_TYPE_TO_BUY"  # Engine B: you type the number to buy; stop, trail and end-of-day sells are automatic
 
 # Same PAIRS/SYMBOLS/PARTNER as the plain system, so both files always
 # watch the exact same tickers with the exact same pair-lock logic.
@@ -393,7 +404,7 @@ EOD_FLATTEN_ET = "15:59"
 POLL_SECONDS = int(os.getenv("POLL_SECONDS") or 20)
 
 # Separate log file from the plain system's, so they never collide.
-LOG_CSV = os.getenv("MOD2_CYBORG_LOG") or "rsi_engineA_redline_log.csv"
+LOG_CSV = os.getenv("MOD2_CYBORG_LOG") or "rsi_engineB_redline_log.csv"
 LOG_COLUMNS = [
     "time_opened", "time_closed", "ticker", "entry", "exit_price",
     "qty", "pnl_pct", "reason",
@@ -1039,7 +1050,7 @@ def show_alert_list():
         return
     lines = ["", "", f"BUY ALERT   {az_clock()}"]
     for sym, a in items:
-        lines.append(f"    {a['num']}   {sym}: {a['text']}")
+        lines.append(f"    {a['num']}   {sym}: {a['text']}{a.get('cost_txt', '')}")
     lines.append("To buy: type the number, press Enter.")
     print("\n".join(lines), flush=True)
 
@@ -1107,7 +1118,7 @@ def handle_buy_number(api, n):
         live_alerts.pop(sym, None)
     LAST_SIGNAL[sym] = a["text"]
     cost_txt = "n/a" if cost is None else f"{cost:.2f}%"
-    log(f"AUTO-BUY #{n}: buying {sym} ({a['text']}) at ~{price:.4f}  cost to trade {cost_txt}")
+    log(f"{'AUTO-BUY' if AUTO_BUY else 'BUY'} #{n}: buying {sym} ({a['text']}) at ~{price:.4f}  cost to trade {cost_txt}")
     print(f"BUYING {sym}: {a['text']}  ~${price:.2f}  cost {cost_txt}", flush=True)
     decision_queue.put(("APPROVE_BUY", sym, price, None))
 
@@ -1181,7 +1192,7 @@ def signal_worker(api):
     carry_done = set()
     last_near = {}
 
-    log(f"Signal worker started (ENGINE A, buys automatically). RED-LINE BUY: red-line angle over {REDLINE_ANGLE_BARS} min >= {REDLINE_MIN_ANGLE:.0f} deg, "
+    log(f"Signal worker started (ENGINE B, you type the number to buy). RED-LINE BUY: red-line angle over {REDLINE_ANGLE_BARS} min >= {REDLINE_MIN_ANGLE:.0f} deg, "
         f"red rising, red below black now or 3 bars ago, black angle > {REDLINE_BLACK_GATE:.0f}. "
         f"CROSS-UP BUY: price angle >= {CROSS_MIN_ANGLE:.0f}, black angle > {SHALLOWED:.0f}. "
         f"OPEN CARRY-OVER BUY: crossed up {CARRY_CROSS_BARS} bars ago or less, price angle >= {CARRY_MIN_ANGLE:.0f}, first {CARRY_WINDOW} bars of the session. "
@@ -1331,6 +1342,15 @@ def signal_worker(api):
                 with live_lock:
                     live_alerts[sym] = {"num": alert_counter[0], "kind": c["kind"], "text": text,
                                         "price": fr.close, "t0": time.time()}
+                if not AUTO_BUY:
+                    try:
+                        _c = cost_pct(api.get_quote(sym))
+                        _t = "   cost: no bid/ask" if _c is None else f"   cost {_c:.2f}%" + ("  <-- WIDE" if _c > COST_MAX_PCT else "")
+                    except Exception as _e:
+                        _t = "   cost: n/a"
+                    with live_lock:
+                        if sym in live_alerts:
+                            live_alerts[sym]["cost_txt"] = _t
                 shown_now += 1
                 last_alert_idx[sym] = fr.bar_index
                 changed = True
@@ -1548,7 +1568,7 @@ def decision_worker(api):
             continue
 
         if action == "APPROVE_BUY":
-            log(f"AUTO-BUY order -- buying {symbol} @ ~{price:.4f}")
+            log(f"{'AUTO-BUY' if AUTO_BUY else 'BUY'} order -- buying {symbol} @ ~{price:.4f}")
             qty = shares_for_dollars(price)
             try:
                 result = api.market_buy(symbol, qty)
@@ -1624,7 +1644,7 @@ def main():
 
     bal = api.get_balance()
     log("=" * 70)
-    log("RSI MOD2 -- ENGINE A REDLINE AUTO (buys by itself; self-contained file)")
+    log("RSI MOD2 -- ENGINE B REDLINE SAME AS A (you type the number to buy; self-contained file)")
     log("=" * 70)
     if bal:
         log(f"BALANCE  equity=${bal['equity']:,.2f}  cash=${bal['cash']:,.2f}")
@@ -1646,12 +1666,13 @@ def main():
 
     premarket_check(api)
     quote_check(api)
-    print("\nENGINE A BUYS BY ITSELF. Typing in this window does nothing. Ctrl-C stops the engine.\n", flush=True)
+    print("\nENGINE B: when a BUY ALERT appears, type its number and press Enter to buy. Ctrl-C stops the engine.\n", flush=True)
 
     threading.Thread(target=signal_worker, args=(api,), daemon=True).start()
     threading.Thread(target=sell_monitor_worker, args=(api,), daemon=True).start()
     threading.Thread(target=reconcile_positions_worker, args=(api,), daemon=True).start()
     threading.Thread(target=decision_worker, args=(api,), daemon=True).start()
+    threading.Thread(target=buy_input_worker, args=(api,), daemon=True).start()
     threading.Thread(target=status_board_worker, daemon=True).start()
 
     HEARTBEAT_SECONDS = 600
@@ -1667,3 +1688,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
