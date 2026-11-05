@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 CHANGED 2026-11-02 evening (Gary's decision) -- THIS FILE: rsi_engineB_redline_same.py
@@ -336,7 +337,7 @@ CROSS_RED_POINTS = 4          # points used for the best-fit angle (price closes
                               # buy prompt in this long,
                                # it auto-expires and keeps holding
 
-TRADE_DOLLARS = 2500  # CHANGED 2026-11-02 (Gary): $2500 per trade (was $1000). Older: CHANGED 2026-10-27 (Gary): $1000 per trade for Engine A. Older note: CHANGED 2026-10-15 (Gary): $500 per trade on both engines. (Was 200.) Older note follows: CHANGED 2026-10-15 (Gary): $200 per trade, matches Engine A. Was 500; RAISED (2026-09-21 night, Gary's decision): was $1
+TRADE_DOLLARS = 5000  # CHANGED 2026-11-04 (Gary): $5000 per trade (was $2500; 3 slots = up to $15,000). Older: CHANGED 2026-11-02 (Gary): $2500 per trade (was $1000). Older: CHANGED 2026-10-27 (Gary): $1000 per trade for Engine A. Older note: CHANGED 2026-10-15 (Gary): $500 per trade on both engines. (Was 200.) Older note follows: CHANGED 2026-10-15 (Gary): $200 per trade, matches Engine A. Was 500; RAISED (2026-09-21 night, Gary's decision): was $1
                      # (forcing 1 share/trade) for the very first live test
                      # of this rewritten signal (0-degree angle filter,
                      # 1.25% bend over 3 min). Gary's own reasoning: "I
@@ -358,7 +359,7 @@ def shares_for_dollars(price: float) -> int:
         return 1
     return max(1, int(TRADE_DOLLARS / price))
 
-MAX_SLOTS = 3    # CHANGED 2026-11-02 (Gary): 3 positions at most (was 4). Same in Engine A and Engine B.
+MAX_SLOTS = 2    # CHANGED 2026-11-04 (Gary): 2 positions at most (was 3; 2 x $5000 = up to $10,000). Older: CHANGED 2026-11-02 (Gary): 3 positions at most (was 4). Same in Engine A and Engine B.
                  # (positions held PLUS buys waiting for your answer count toward the 3).
 STALE_BAR_MINUTES = 4   # 2026-10-15: newest bar must be from today and no older than this many minutes
 
@@ -1688,4 +1689,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
