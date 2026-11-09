@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 CHANGED 2026-11-02 evening (Gary's decision) -- THIS FILE: rsi_engineB_redline_same.py
@@ -384,7 +383,7 @@ RSI_MOD2_MODE = "ALERT_THEN_TYPE_TO_BUY"  # Engine B: you type the number to buy
 PAIRS = [
     ("AAOX",), ("ASTX",), ("IRE",), ("NBIL",),
     ("BEX", "BEZ"), ("CWVX", "CORD"), ("SNXX", "SNDQ"), ("SOXL", "SOXS"),
-]  # 2026-11-02 (Gary): 12 stocks (was 17; APLX RKLX SMCX IREZ NBIZ out). Pair lock only where a stock has an inverse partner here.
+]  # 2026-11-07 (Gary): QBTX/QBTZ and RGTX/RGTZ REMOVED again (too little volume; 12 stocks). Older: 2026-11-02 (Gary): 12 stocks (was 17; APLX RKLX SMCX IREZ NBIZ out). Pair lock only where a stock has an inverse partner here.
 SYMBOLS = sorted(s for pr in PAIRS for s in pr)   # alphabetical: the status board reads in this order
 PARTNER = {}
 for _grp in PAIRS:
