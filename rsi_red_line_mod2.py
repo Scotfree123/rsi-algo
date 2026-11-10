@@ -57,7 +57,7 @@ CHANGED 2026-10-25 (Gary's decision) -- FILE: rsi_engineB_redline.py
     3. NO MORE Y/Enter questions. Alerts go on a numbered BUY ALERT list under the status board.
        To buy: type the number and press Enter (several numbers with a space also work). Doing
        nothing buys nothing. An alert leaves the list when its signal ends, when you buy it, when you
-       hold it, or after ALERT_LIST_MAX_MINUTES (10). Numbers never change while a stock is on the
+       hold it, or after ALERT_LIST_MAX_MINUTES (5). Numbers never change while a stock is on the
        list and are never reused during a run. An alert stays up at least ALERT_MIN_MINUTES (3) even if its
        signal ends sooner, so you have time to look. A stock never appears twice (a red-line alert that
        then crosses up stays on the same number and becomes CROSS-UP BUY).
@@ -313,7 +313,7 @@ REDLINE_MIN_ANGLE = float(os.getenv("B_MIN_ANGLE") or os.getenv("A_MIN_ANGLE") o
 STRONG_ANGLE = 25.0           # strength words, same angle
 MEDIUM_ANGLE = 18.0
 REDLINE_BLACK_GATE = -35.0    # black-line 10-minute angle must be above this for a RED-LINE BUY
-ALERT_LIST_MAX_MINUTES = 10   # an alert leaves the BUY ALERT list after this long
+ALERT_LIST_MAX_MINUTES = 5    # CHANGED 2026-11-09 (Gary): an alert leaves the BUY ALERT list after this long (was 10)
 ALERT_MIN_MINUTES = 3         # an alert stays up at least this long even if its signal ends sooner (time to look)
 MAX_NEW_PER_MINUTE = 3        # at most this many NEW alerts shown per minute (strongest first)
 REALERT_COOLDOWN_BARS = 10    # same stock cannot get a new red-line alert sooner than this many bars
@@ -1688,3 +1688,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
