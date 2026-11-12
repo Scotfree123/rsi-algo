@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 CHANGED 2026-11-02 evening (Gary's decision) -- THIS FILE: rsi_engineB_redline_same.py
@@ -367,8 +368,9 @@ STALE_BAR_MINUTES = 4   # 2026-10-15: newest bar must be from today and no older
 #  1. The lines (black = EMA 20, red = HMA 7) are built on 3-MINUTE candles (aligned to 4:00 ET; 9:30 ET if the
 #     stock has under 10 pre-market bars). The engine still reads 1-minute bars from TradeStation and builds the
 #     3-minute candles itself, so the candles match the test (replay of Oct 5 - Nov 9, 26 days).
-#  2. One buy alert, the TREND alert: red above black, red rising, red-line angle over 3 candles >= TREND_MIN_ANGLE,
-#     the gap (red - black) wider than on the candle before, black-line 10-candle angle above TREND_BLACK_MIN.
+#  2. One buy alert, the TREND alert: red line rising, red-line angle over TREND_ANGLE_CANDLES candle(s) >= TREND_MIN_ANGLE, black-line
+#     10-candle angle above TREND_BLACK_MIN. The red line can be anywhere (above or below black). Simplified on
+#     2026-11-11: the old 'red above black' and 'gap widening' tests changed only 4 of 254 alerts in the replay.
 #     Fires on the FIRST candle of a run, then waits TREND_COOLDOWN_BARS candles. Angles are in % per MINUTE, so
 #     the numbers mean the same as in the 1-minute engine. CROSS-UP / RED-LINE / OPEN CARRY-OVER alerts are gone.
 #  3. NO automatic 2% stop and NO trailing stop (you sell by hand). Switch them back on with AUTO_STOPS=1 in .env.
@@ -382,6 +384,7 @@ CANDLE_MINUTES = 3
 CANDLE_GRACE_MIN = 0.25        # a candle counts as finished 15 seconds after its end (lets the last bar arrive)
 TREND_MIN_ANGLE = float(os.getenv("TREND_MIN_ANGLE") or 18.0)
 TREND_BLACK_MIN = float(os.getenv("TREND_BLACK_MIN") or 0.0)
+TREND_ANGLE_CANDLES = int(os.getenv("TREND_ANGLE_CANDLES") or 1)   # red-line angle is measured over this many 3-minute candles (1 = 3 minutes, 3 = 9 minutes). 2026-11-12: was 3 (9 min), changed to 1 (3 min) by Gary
 TREND_COOLDOWN_BARS = 4        # candles (12 minutes) before the same stock can get another TREND alert
 WARMUP_CANDLES = 12            # no alert before this many candles of today
 ELIGIBLE_FIRST_DONE_MIN = 9 * 60 + 29    # candle must have finished at 9:29 ET or later (alert comes at 9:30)
@@ -410,6 +413,7 @@ RSI_MOD2_MODE = "ALERT_THEN_TYPE_TO_BUY"  # 3-minute Engine B: you type the numb
 # actually improved, from 6.55% to 7.27%, in the smaller group).
 PAIRS = [
     ("AAOX",), ("ASTX",), ("IRE",), ("NBIL",),
+    ("RGTX",),   # 2026-11-11 (Gary): quantum 2x moving a lot; RGTZ (inverse) left out, too little volume
     ("BEX", "BEZ"), ("CWVX", "CORD"), ("SNXX", "SNDQ"), ("SOXL", "SOXS"),
 ]  # 2026-11-07 (Gary): QBTX/QBTZ and RGTX/RGTZ REMOVED again (too little volume; 12 stocks). Older: 2026-11-02 (Gary): 12 stocks (was 17; APLX RKLX SMCX IREZ NBIZ out). Pair lock only where a stock has an inverse partner here.
 SYMBOLS = sorted(s for pr in PAIRS for s in pr)   # alphabetical: the status board reads in this order
@@ -751,7 +755,7 @@ class Frame:
     red_angle: float = float("nan")        # 2026-10-20: red line angle, best fit over last CROSS_RED_POINTS points
     black_prev3: float = float("nan")      # 2026-10-27: black line value three bars ago
     bars_since_cross: int = 999            # 2026-10-27: bars since red last crossed UP through black (0 = this bar)
-    tr_angle: float = float("nan")         # 3-MIN ENGINE: red-line angle over 3 candles, % per minute
+    tr_angle: float = float("nan")         # 3-MIN ENGINE: red-line angle over TREND_ANGLE_CANDLES candle(s), % per minute
     gap_now: float = float("nan")          # 3-MIN ENGINE: (red - black) / black * 100 on the last candle
     gap_prev: float = float("nan")
     trend_on: bool = False                 # 3-MIN ENGINE: TREND rule true on the last candle
@@ -894,15 +898,15 @@ def build_frame3(c3):
     c = close.to_numpy()
     gap = (r - b) / b * 100.0
     ra = np.full(n, np.nan)
-    for i in range(3, n):
-        if not np.isnan(r[i]) and not np.isnan(r[i - 3]) and c[i] > 0:
-            ra[i] = math.degrees(math.atan((r[i] - r[i - 3]) / c[i] * 100.0 / 3 / CANDLE_MINUTES))
+    L = TREND_ANGLE_CANDLES
+    for i in range(L, n):
+        if not np.isnan(r[i]) and not np.isnan(r[i - L]) and c[i] > 0:
+            ra[i] = math.degrees(math.atan((r[i] - r[i - L]) / c[i] * 100.0 / L / CANDLE_MINUTES))
     S = np.zeros(n, dtype=bool)
     for i in range(1, n):
         if np.isnan(r[i]) or np.isnan(ba[i]) or np.isnan(ra[i]) or np.isnan(r[i - 1]):
             continue
-        S[i] = bool((r[i] > b[i]) and (r[i] > r[i - 1]) and (gap[i] > gap[i - 1])
-                    and (ra[i] >= TREND_MIN_ANGLE) and (ba[i] > TREND_BLACK_MIN))
+        S[i] = bool((r[i] > r[i - 1]) and (ra[i] >= TREND_MIN_ANGLE) and (ba[i] > TREND_BLACK_MIN))
     return Frame(
         ts=c3.index[-1], close=float(c[-1]), open_=float(c3["open"].iloc[-1]), low=float(c3["low"].iloc[-1]),
         red_now=float(r[-1]), red_prev=float(r[-2]), red_prev2=float(r[-3]), red_prev3=float(r[-4]),
@@ -1305,8 +1309,8 @@ def signal_worker(api):
     mode_logged = set()
     drop_warned = {}
 
-    log(f"Signal worker started (ENGINE B 3-MINUTE, you type the number to buy). TREND BUY: red above black, red rising, "
-        f"red-line angle over 3 candles >= {TREND_MIN_ANGLE:.0f} deg (per minute), gap widening, black angle > {TREND_BLACK_MIN:.0f}. "
+    log(f"Signal worker started (ENGINE B 3-MINUTE, you type the number to buy). TREND BUY: red rising, "
+        f"red-line angle over {TREND_ANGLE_CANDLES*CANDLE_MINUTES} minutes >= {TREND_MIN_ANGLE:.0f} deg (per minute), black angle > {TREND_BLACK_MIN:.0f}, red line anywhere. "
         f"Cost filter: {'ON, max %.2f%%' % COST_MAX_PCT if COST_FILTER else 'OFF'}. "
         f"MAX_SLOTS={MAX_SLOTS}, pair-lock ON, no new buys after {NO_NEW_AFTER_ET} ET.")
 
@@ -1455,7 +1459,7 @@ LONG_SYMBOLS = tuple(s for s in SYMBOLS if s not in SHORT_SYMBOLS)
 def status_board_worker():
     """Once a minute: every stock in two groups, LONGS and SHORTS.
     angle = black-line (EMA20) 10-minute angle;  red = up/down vs the bar before;
-    rl = red-line (HMA7) angle over 3 candles; gap = red above/below black in percent; ON = the TREND rule is true now.
+    rl = red-line (HMA7) angle over TREND_ANGLE_CANDLES candle(s); gap = red above/below black in percent; ON = the TREND rule is true now.
     All numbers are on 3-MINUTE candles (angles in % per minute)."""
     while _RUNNING:
         time.sleep(STATUS_BOARD_SECONDS)
@@ -1729,8 +1733,8 @@ def main():
         log(f"BALANCE  equity=${bal['equity']:,.2f}  cash=${bal['cash']:,.2f}")
         if api.env == "live" and not api.dry_run:
             log("         ^ CHECK THIS ACCOUNT. Ctrl-C now if it is wrong.")
-    log(f"BUYS     3-MINUTE TREND: red above black, rising, red-line angle over 3 candles >= {TREND_MIN_ANGLE:.0f} (per minute), "
-        f"gap widening, black angle > {TREND_BLACK_MIN:.0f}  |  cooldown {TREND_COOLDOWN_BARS} candles  |  DROP warning {DROP_WARN_PCT:.0f}% in 2 candles")
+    log(f"BUYS     3-MINUTE TREND: red rising, red-line angle over {TREND_ANGLE_CANDLES*CANDLE_MINUTES} minutes >= {TREND_MIN_ANGLE:.0f} (per minute), "
+        f"black angle > {TREND_BLACK_MIN:.0f}, red line anywhere  |  cooldown {TREND_COOLDOWN_BARS} candles  |  DROP warning {DROP_WARN_PCT:.0f}% in 2 candles")
     log(f"COST     filter {'ON: skip a buy if (ask-bid)/midpoint > %.2f%% or no bid/ask' % COST_MAX_PCT if COST_FILTER else 'OFF'}")
     log(f"STOPS    " + (f"ON: stop {STOP_PCT:.1f}% and trailing {TRAIL_PCT:.1f}%" if AUTO_STOPS else "OFF (you sell by hand)")
         + (f"  |  EMERGENCY STOP {EMERGENCY_STOP_PCT:.0f}%" if EMERGENCY_STOP_PCT > 0 else "  |  emergency stop OFF"))
@@ -1769,4 +1773,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+        
