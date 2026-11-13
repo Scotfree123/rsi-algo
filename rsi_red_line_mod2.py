@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 CHANGED 2026-11-02 evening (Gary's decision) -- THIS FILE: rsi_engineB_redline_same.py
@@ -306,6 +305,10 @@ WARMUP_BARS    = 12  # SET (2026-09-14, Gary's decision): after building the
 # -5% hard-floor/manual-only exit) ----
 STOP_PCT = 2.0
 TRAIL_PCT = 2.5
+# 2026-11-13 (Gary): NO automatic 2% stop and NO trailing stop (he sells by hand). Only the end-of-day sell stays.
+# AUTO_STOPS=1 in .env turns them back on. EMERGENCY_STOP_PCT (default 0 = off), e.g. 10, is an optional wide stop.
+AUTO_STOPS = (os.getenv("AUTO_STOPS") or "0") != "0"
+EMERGENCY_STOP_PCT = float(os.getenv("EMERGENCY_STOP_PCT") or 0.0)
 SELL_ALERT_COOLDOWN_SECONDS = 90
 POPUP_TIMEOUT_SECONDS = 45    # CHANGED 2026-10-20 (Gary): 45 s. (2026-09-03: 180 s; was 600)
 CROSS_MIN_ANGLE = 30.0        # 2026-10-21: steep cross-up alert needs PRICE angle >= this (degrees)
@@ -320,7 +323,7 @@ MAX_NEW_PER_MINUTE = 3        # at most this many NEW alerts shown per minute (s
 REALERT_COOLDOWN_BARS = 10    # same stock cannot get a new red-line alert sooner than this many bars
 MIN_PM_BARS = 10              # fewer pre-market bars than this today -> that stock uses lines from 9:30
 SESSION_TEMPLATE = "USEQPreAndPost"
-ALERT_LOG_CSV = os.getenv("ALERT_LOG_CSV") or "engineB3_alerts_log.csv"
+ALERT_LOG_CSV = os.getenv("ALERT_LOG_CSV") or "engineB_alerts_log.csv"
 AUTO_BUY = False                                 # Engine B: YOU type the number to buy
 COST_FILTER = (os.getenv("COST_FILTER") or "1") != "0"
 COST_MAX_PCT = float(os.getenv("COST_MAX_PCT") or 0.5)   # skip a buy if (ask-bid)/midpoint is above this percent
@@ -363,41 +366,11 @@ MAX_SLOTS = 2    # CHANGED 2026-11-04 (Gary): 2 positions at most (was 3; 2 x $5
                  # (positions held PLUS buys waiting for your answer count toward the 3).
 STALE_BAR_MINUTES = 4   # 2026-10-15: newest bar must be from today and no older than this many minutes
 
-# ===== 3-MINUTE ENGINE (2026-11-11, Gary) =====================================================================
-# Same engine as Engine B (061c632f) with these changes, all from Gary's decisions on 2026-11-11:
-#  1. The lines (black = EMA 20, red = HMA 7) are built on 3-MINUTE candles (aligned to 4:00 ET; 9:30 ET if the
-#     stock has under 10 pre-market bars). The engine still reads 1-minute bars from TradeStation and builds the
-#     3-minute candles itself, so the candles match the test (replay of Oct 5 - Nov 9, 26 days).
-#  2. One buy alert, the TREND alert: red line rising, red-line angle over TREND_ANGLE_CANDLES candle(s) >= TREND_MIN_ANGLE, black-line
-#     10-candle angle above TREND_BLACK_MIN. The red line can be anywhere (above or below black). Simplified on
-#     2026-11-11: the old 'red above black' and 'gap widening' tests changed only 4 of 254 alerts in the replay.
-#     Fires on the FIRST candle of a run, then waits TREND_COOLDOWN_BARS candles. Angles are in % per MINUTE, so
-#     the numbers mean the same as in the 1-minute engine. CROSS-UP / RED-LINE / OPEN CARRY-OVER alerts are gone.
-#  3. NO automatic 2% stop and NO trailing stop (you sell by hand). Switch them back on with AUTO_STOPS=1 in .env.
-#     EMERGENCY_STOP_PCT (default 0 = off) is an optional wide stop, e.g. 10.
-#  4. DROP warning: if a stock you hold falls DROP_WARN_PCT (3%) or more in 2 candles you get a message on screen.
-#     It never sells.
-#  5. The end-of-day sell at 15:59 ET stays.
-#  6. Its own log files (rsi_engineB3_log.csv, engineB3_alerts_log.csv). Run it INSTEAD of the 1-minute engine,
-#     not beside it: both would take your typed numbers and could buy the same stock twice.
-CANDLE_MINUTES = 3
-CANDLE_GRACE_MIN = 0.25        # a candle counts as finished 15 seconds after its end (lets the last bar arrive)
-TREND_MIN_ANGLE = float(os.getenv("TREND_MIN_ANGLE") or 18.0)
-TREND_BLACK_MIN = float(os.getenv("TREND_BLACK_MIN") or 0.0)
-TREND_ANGLE_CANDLES = int(os.getenv("TREND_ANGLE_CANDLES") or 1)   # red-line angle is measured over this many 3-minute candles (1 = 3 minutes, 3 = 9 minutes). 2026-11-12: was 3 (9 min), changed to 1 (3 min) by Gary
-TREND_COOLDOWN_BARS = 4        # candles (12 minutes) before the same stock can get another TREND alert
-WARMUP_CANDLES = 12            # no alert before this many candles of today
-ELIGIBLE_FIRST_DONE_MIN = 9 * 60 + 29    # candle must have finished at 9:29 ET or later (alert comes at 9:30)
-ELIGIBLE_LAST_DONE_MIN = 15 * 60 + 28
-AUTO_STOPS = (os.getenv("AUTO_STOPS") or "0") != "0"            # 2% stop + 2.5% trailing stop: OFF by decision
-EMERGENCY_STOP_PCT = float(os.getenv("EMERGENCY_STOP_PCT") or 0.0)   # 0 = off
-DROP_WARN_PCT = float(os.getenv("DROP_WARN_PCT") or 3.0)
-
 RSI_LEN = 7                 # B2: RSI period (Wilder), computed from today's bars only
 RSI_DIP_LEVEL = 30.0        # B2: RSI must have been at or below this recently
 RSI_DIP_LOOKBACK_BARS = 15  # B2: ...within this many minutes (including now)
 
-RSI_MOD2_MODE = "ALERT_THEN_TYPE_TO_BUY"  # 3-minute Engine B: you type the number to buy; the only automatic sell is end of day (stops are off unless AUTO_STOPS=1)
+RSI_MOD2_MODE = "ALERT_THEN_TYPE_TO_BUY"  # Engine B: you type the number to buy; stop, trail and end-of-day sells are automatic
 
 # Same PAIRS/SYMBOLS/PARTNER as the plain system, so both files always
 # watch the exact same tickers with the exact same pair-lock logic.
@@ -413,7 +386,6 @@ RSI_MOD2_MODE = "ALERT_THEN_TYPE_TO_BUY"  # 3-minute Engine B: you type the numb
 # actually improved, from 6.55% to 7.27%, in the smaller group).
 PAIRS = [
     ("AAOX",), ("ASTX",), ("IRE",), ("NBIL",),
-    ("RGTX",),   # 2026-11-11 (Gary): quantum 2x moving a lot; RGTZ (inverse) left out, too little volume
     ("BEX", "BEZ"), ("CWVX", "CORD"), ("SNXX", "SNDQ"), ("SOXL", "SOXS"),
 ]  # 2026-11-07 (Gary): QBTX/QBTZ and RGTX/RGTZ REMOVED again (too little volume; 12 stocks). Older: 2026-11-02 (Gary): 12 stocks (was 17; APLX RKLX SMCX IREZ NBIZ out). Pair lock only where a stock has an inverse partner here.
 SYMBOLS = sorted(s for pr in PAIRS for s in pr)   # alphabetical: the status board reads in this order
@@ -436,7 +408,7 @@ EOD_FLATTEN_ET = "15:59"
 POLL_SECONDS = int(os.getenv("POLL_SECONDS") or 20)
 
 # Separate log file from the plain system's, so they never collide.
-LOG_CSV = os.getenv("MOD2_CYBORG_LOG") or "rsi_engineB3_log.csv"
+LOG_CSV = os.getenv("MOD2_CYBORG_LOG") or "rsi_engineB_redline_log.csv"
 LOG_COLUMNS = [
     "time_opened", "time_closed", "ticker", "entry", "exit_price",
     "qty", "pnl_pct", "reason",
@@ -755,12 +727,6 @@ class Frame:
     red_angle: float = float("nan")        # 2026-10-20: red line angle, best fit over last CROSS_RED_POINTS points
     black_prev3: float = float("nan")      # 2026-10-27: black line value three bars ago
     bars_since_cross: int = 999            # 2026-10-27: bars since red last crossed UP through black (0 = this bar)
-    tr_angle: float = float("nan")         # 3-MIN ENGINE: red-line angle over TREND_ANGLE_CANDLES candle(s), % per minute
-    gap_now: float = float("nan")          # 3-MIN ENGINE: (red - black) / black * 100 on the last candle
-    gap_prev: float = float("nan")
-    trend_on: bool = False                 # 3-MIN ENGINE: TREND rule true on the last candle
-    trend_was: bool = False                # ... and on the candle before it
-    close_prev2: float = float("nan")      # close two candles ago (DROP warning)
 
 
 def build_frame(df: pd.DataFrame) -> Frame:
@@ -849,88 +815,6 @@ def build_frame(df: pd.DataFrame) -> Frame:
         black_prev3=_safe(black, -4),
         bars_since_cross=_since,
     )
-
-
-def to_candles(df, now_et, start_min):
-    """Today's 1-minute bars (index UTC) -> FINISHED 3-minute candles on a grid that starts at start_min
-    (240 = 4:00 ET, or 570 = 9:30 ET). A candle is finished CANDLE_GRACE_MIN after its end; a candle with only
-    one 1-minute bar in it is dropped (same as the replay test)."""
-    et = df.index.tz_convert(ET)
-    mins = np.asarray(et.hour) * 60 + np.asarray(et.minute)
-    grp = (mins - start_min) // CANDLE_MINUTES * CANDLE_MINUTES + start_min
-    d = df.copy()
-    d["grp"] = grp
-    agg = d.groupby("grp").agg(open=("open", "first"), high=("high", "max"), low=("low", "min"),
-                               close=("close", "last"), volume=("volume", "sum"), n=("close", "size"))
-    now_min = now_et.hour * 60 + now_et.minute + now_et.second / 60.0
-    agg = agg[(agg.index.to_numpy() + CANDLE_MINUTES + CANDLE_GRACE_MIN <= now_min) & (agg["n"] >= 2)]
-    if agg.empty:
-        return agg
-    day0 = et[0].replace(hour=0, minute=0, second=0, microsecond=0)
-    agg.index = pd.DatetimeIndex([(day0 + pd.Timedelta(minutes=int(g))).tz_convert("UTC") for g in agg.index])
-    return agg
-
-
-def build_frame3(c3):
-    """Lines and the TREND test on 3-minute candles. Returns a Frame for the LAST finished candle, or None."""
-    n = len(c3)
-    if n < 4:
-        return None
-    close = c3["close"]
-    black = ema(close, EMA_LEN)
-    red = hma(close, HMA_LEN)
-    ws = ANGLE_LOOKBACK + 1
-    x = np.arange(ws, dtype=float)
-    xc = x - x.mean()
-    den = (xc ** 2).sum()
-
-    def _slope_deg(v):
-        if np.isnan(v).any():
-            return np.nan
-        m = v.mean()
-        if m <= 0:
-            return np.nan
-        return float(np.degrees(np.arctan((xc * (v - m)).sum() / den / m * 100.0 / CANDLE_MINUTES)))
-
-    ba = black.rolling(ws).apply(_slope_deg, raw=True).to_numpy()
-    r = red.to_numpy()
-    b = black.to_numpy()
-    c = close.to_numpy()
-    gap = (r - b) / b * 100.0
-    ra = np.full(n, np.nan)
-    L = TREND_ANGLE_CANDLES
-    for i in range(L, n):
-        if not np.isnan(r[i]) and not np.isnan(r[i - L]) and c[i] > 0:
-            ra[i] = math.degrees(math.atan((r[i] - r[i - L]) / c[i] * 100.0 / L / CANDLE_MINUTES))
-    S = np.zeros(n, dtype=bool)
-    for i in range(1, n):
-        if np.isnan(r[i]) or np.isnan(ba[i]) or np.isnan(ra[i]) or np.isnan(r[i - 1]):
-            continue
-        S[i] = bool((r[i] > r[i - 1]) and (ra[i] >= TREND_MIN_ANGLE) and (ba[i] > TREND_BLACK_MIN))
-    return Frame(
-        ts=c3.index[-1], close=float(c[-1]), open_=float(c3["open"].iloc[-1]), low=float(c3["low"].iloc[-1]),
-        red_now=float(r[-1]), red_prev=float(r[-2]), red_prev2=float(r[-3]), red_prev3=float(r[-4]),
-        angle_now=float(ba[-1]), angle_was=float("nan"), bar_index=n - 1, atr_pct_now=float("nan"),
-        black_now=float(b[-1]), black_prev=float(b[-2]), black_prev3=float(b[-4]),
-        bars_since_cross=999,
-        tr_angle=float(ra[-1]), gap_now=float(gap[-1]), gap_prev=float(gap[-2]),
-        trend_on=bool(S[-1]), trend_was=bool(S[-2]), close_prev2=float(c[-3]),
-    )
-
-
-def trend_alert_due(fr, last_alert_idx):
-    """True when a NEW TREND alert should be raised on this candle: first candle of a run, inside the
-    eligible window, and past the cooldown for this stock."""
-    if fr is None or not (fr.trend_on and not fr.trend_was):
-        return False
-    try:
-        et = pd.Timestamp(fr.ts).tz_convert(ET)
-    except Exception:
-        return False
-    done_min = et.hour * 60 + et.minute + CANDLE_MINUTES - 1
-    if not (ELIGIBLE_FIRST_DONE_MIN <= done_min <= ELIGIBLE_LAST_DONE_MIN):
-        return False
-    return fr.bar_index - last_alert_idx >= TREND_COOLDOWN_BARS
 
 
 def black_gate_open(fr: Frame) -> bool:
@@ -1298,19 +1182,24 @@ def pair_leg_open(sym):
 
 
 def signal_worker(api):
-    """Every poll: read 1-minute bars, build today's 3-minute candles and lines for each stock, then
-       - TREND BUY alert (see the 3-MINUTE ENGINE note near the top of this file)
-       - DROP warning for stocks you hold (down DROP_WARN_PCT or more in 2 candles)
+    """Every poll: rebuild the lines for each stock, then
+       - RED-LINE BUY: red-line angle over 3 min >= 13, red still rising, red below black, black angle > -35
+       - CROSS-UP BUY: red crosses up through black, price angle >= 30, black angle > -15 (unchanged)
     New alerts go on the numbered BUY ALERT list (at most 3 new per minute, strongest first)."""
+    last_cross_bar = {}
     processed_bar = {}
+    alert_armed = {s: True for s in SYMBOLS}
     last_alert_idx = {}
     shown_by_minute = {}
     stale_logged = set()
     mode_logged = set()
-    drop_warned = {}
+    carry_done = set()
+    last_near = {}
 
-    log(f"Signal worker started (ENGINE B 3-MINUTE, you type the number to buy). TREND BUY: red rising, "
-        f"red-line angle over {TREND_ANGLE_CANDLES*CANDLE_MINUTES} minutes >= {TREND_MIN_ANGLE:.0f} deg (per minute), black angle > {TREND_BLACK_MIN:.0f}, red line anywhere. "
+    log(f"Signal worker started (ENGINE B, you type the number to buy). RED-LINE BUY: red-line angle over {REDLINE_ANGLE_BARS} min >= {REDLINE_MIN_ANGLE:.0f} deg, "
+        f"red rising, red below black now or 3 bars ago, black angle > {REDLINE_BLACK_GATE:.0f}. "
+        f"CROSS-UP BUY: price angle >= {CROSS_MIN_ANGLE:.0f}, black angle > {SHALLOWED:.0f}. "
+        f"OPEN CARRY-OVER BUY: crossed up {CARRY_CROSS_BARS} bars ago or less, price angle >= {CARRY_MIN_ANGLE:.0f}, first {CARRY_WINDOW} bars of the session. "
         f"Cost filter: {'ON, max %.2f%%' % COST_MAX_PCT if COST_FILTER else 'OFF'}. "
         f"MAX_SLOTS={MAX_SLOTS}, pair-lock ON, no new buys after {NO_NEW_AFTER_ET} ET.")
 
@@ -1330,13 +1219,9 @@ def signal_worker(api):
                 if raw is None:
                     continue
                 df, used_pm, pm_n = prepare_today(raw, now_et)
-                if df is None or len(df) < 30:
+                if df is None or len(df) < WARMUP_BARS + 1:
                     continue
-                start_min = 240 if used_pm else 570
-                c3 = to_candles(df, now_et, start_min)
-                fr = build_frame3(c3)
-                if fr is None:
-                    continue
+                fr = build_frame(df)
                 latest_frame[sym] = fr   # cache for the live status board
             except Exception as e:
                 log(f"WARN {sym}: {e}")
@@ -1344,11 +1229,11 @@ def signal_worker(api):
 
             if sym not in mode_logged:
                 mode_logged.add(sym)
-                log(f"LINES {sym}: 3-minute candles " + (f"built from pre-market bars ({pm_n} pre-market bars today)" if used_pm
+                log(f"LINES {sym}: " + (f"built from pre-market bars ({pm_n} pre-market bars today)" if used_pm
                     else f"built from 9:30 ET (only {pm_n} pre-market bars today, need {MIN_PM_BARS})"))
 
             try:
-                last_bar_et = df.index[-1].tz_convert(ET)
+                last_bar_et = pd.Timestamp(fr.ts).tz_convert(ET)
                 bar_age_min = (now_et - last_bar_et).total_seconds() / 60.0
             except Exception:
                 continue
@@ -1358,38 +1243,74 @@ def signal_worker(api):
                     log(f"STALE-SKIP {sym}: newest bar is {last_bar_et.strftime('%Y-%m-%d %H:%M')} ET "
                         f"({bar_age_min:.1f} min old) -- waiting for fresh bars from today")
                 continue
-            if fr.bar_index < WARMUP_CANDLES:
+            if fr.bar_index < WARMUP_BARS:
                 continue
 
-            candle_key = str(fr.ts)
+            a3 = redline_buy(fr)
+            bar_key = str(fr.ts)
+            is_cross = steep_cross_up(fr) and last_cross_bar.get(sym) != bar_key
             entry = live_alerts.get(sym)
+
+            if not held and new_ok and last_near.get(sym) != bar_key and near_miss_cross(fr):
+                last_near[sym] = bar_key
+                log(f"NEAR-MISS {sym}: cross-up with price angle {fr.red_angle:.0f} (below {CROSS_MIN_ANGLE:.0f}) @ {fr.close:.4f} -- logged only, not bought")
+                append_alert_row({"date": str(now_et.date()), "time_az": az_clock(), "ticker": sym,
+                                  "kind": "CROSS-UP NEAR-MISS", "price_angle": f"{fr.red_angle:.0f}",
+                                  "black_angle": f"{fr.angle_now:+.1f}", "price": f"{fr.close:.4f}",
+                                  "shown": "N", "note": "20-30 deg, logged only"})
 
             if held:
                 if entry is not None:
                     with live_lock:
                         live_alerts.pop(sym, None)
                     changed = True
-                if (not math.isnan(fr.close_prev2)) and fr.close_prev2 > 0:
-                    drop = (fr.close / fr.close_prev2 - 1.0) * 100.0
-                    if drop <= -DROP_WARN_PCT and drop_warned.get(sym) != candle_key:
-                        drop_warned[sym] = candle_key
-                        print(f"\n*** DROP WARNING {sym}: down {abs(drop):.1f}% in 2 candles (6 minutes), now {fr.close:.4f}. "
-                              f"Nothing is sold for you. ***\n", flush=True)
-                        log(f"DROP-WARNING {sym}: {drop:+.1f}% over 2 candles @ {fr.close:.4f}")
+                if is_cross:
+                    last_cross_bar[sym] = bar_key
+                    print(f"\n{sym}: already holding\n", flush=True)
+                    log(f"ALREADY-HOLDING {sym} cross-up @ {fr.close:.4f}")
                 continue
 
-            if entry is not None:
+            if is_cross:
+                last_cross_bar[sym] = bar_key
+                if entry is not None:
+                    entry["kind"] = "CROSS"
+                    entry["text"] = "CROSS-UP BUY"
+                    entry["t0"] = time.time()
+                    changed = True
+                    log(f"ALERT-UPGRADE {sym}: red-line alert is now a CROSS-UP BUY @ {fr.close:.4f}")
+                    append_alert_row({"date": str(now_et.date()), "time_az": az_clock(), "ticker": sym,
+                                      "kind": "CROSS-UP", "price_angle": f"{fr.red_angle:.0f}",
+                                      "black_angle": f"{fr.angle_now:+.1f}", "price": f"{fr.close:.4f}",
+                                      "shown": "Y", "note": "upgrade of a listed red-line alert"})
+                elif new_ok:
+                    candidates.append({"sym": sym, "kind": "CROSS", "score": 100.0 + fr.red_angle,
+                                       "fr": fr, "a3": a3, "minute": bar_key, "word": ""})
+            elif entry is not None:
                 age_min = (time.time() - entry["t0"]) / 60.0
-                ended = not fr.trend_on
+                if entry["kind"] == "RED":
+                    ended = a3 is None
+                else:
+                    ended = not (fr.red_now > fr.black_now and fr.red_now > fr.red_prev)
                 if (ended and age_min >= ALERT_MIN_MINUTES) or age_min > ALERT_LIST_MAX_MINUTES:
                     with live_lock:
                         live_alerts.pop(sym, None)
                     changed = True
                     log(f"ALERT-ENDED {sym} ({'signal ended' if ended else 'listed over %d min' % ALERT_LIST_MAX_MINUTES})")
-            elif new_ok and processed_bar.get(sym) != candle_key and trend_alert_due(fr, last_alert_idx.get(sym, -999)):
-                processed_bar[sym] = candle_key
-                candidates.append({"sym": sym, "kind": "TREND", "score": fr.tr_angle, "fr": fr, "a3": fr.tr_angle,
-                                   "minute": candle_key, "word": strength_word(fr.tr_angle)})
+            else:
+                if a3 is None:
+                    alert_armed[sym] = True
+                    if (new_ok and sym not in carry_done and processed_bar.get(sym) != bar_key
+                            and carry_over(fr, last_bar_et)):
+                        carry_done.add(sym)
+                        processed_bar[sym] = bar_key
+                        candidates.append({"sym": sym, "kind": "CARRY", "score": 50.0 + fr.red_angle,
+                                           "fr": fr, "a3": None, "minute": bar_key, "word": ""})
+                elif (alert_armed[sym] and new_ok and processed_bar.get(sym) != bar_key
+                      and fr.bar_index - last_alert_idx.get(sym, -999) >= REALERT_COOLDOWN_BARS):
+                    processed_bar[sym] = bar_key
+                    alert_armed[sym] = False
+                    candidates.append({"sym": sym, "kind": "RED", "score": a3, "fr": fr, "a3": a3,
+                                       "minute": bar_key, "word": strength_word(a3)})
 
         # ---- decide which new alerts to show (strongest first, at most MAX_NEW_PER_MINUTE per minute)
         by_min = {}
@@ -1402,8 +1323,10 @@ def signal_worker(api):
             for c in lst:
                 sym, fr = c["sym"], c["fr"]
                 base = {"date": str(now_et.date()), "time_az": az_clock(), "ticker": sym,
-                        "kind": "TREND", "strength": c["word"],
-                        "redline_angle": f"{c['a3']:.1f}", "price_angle": f"gap {fr.gap_now:.2f}%",
+                        "kind": "CROSS-UP" if c["kind"] == "CROSS" else "OPEN-CARRY" if c["kind"] == "CARRY" else "RED-LINE",
+                        "strength": c["word"],
+                        "redline_angle": "" if c["a3"] is None else f"{c['a3']:.1f}",
+                        "price_angle": "" if math.isnan(fr.red_angle) else f"{fr.red_angle:.0f}",
                         "black_angle": f"{fr.angle_now:+.1f}", "price": f"{fr.close:.4f}"}
                 if slots_in_use() >= MAX_SLOTS:
                     log(f"SLOT-SKIP {sym} (slots full {MAX_SLOTS})")
@@ -1414,13 +1337,14 @@ def signal_worker(api):
                     append_alert_row({**base, "shown": "N", "note": "pair lock"})
                     continue
                 if shown_now >= room:
-                    log(f"LOGGED-ONLY {sym} TREND {c['word']} (more than {MAX_NEW_PER_MINUTE} new alerts this minute)")
+                    log(f"LOGGED-ONLY {sym} {base['kind']} {c['word']} (more than {MAX_NEW_PER_MINUTE} new alerts this minute)")
                     append_alert_row({**base, "shown": "N", "note": "cap per minute"})
                     continue
                 alert_counter[0] += 1
-                text = f"TREND BUY {c['word']}"
+                text = (f"RED-LINE BUY {c['word']}" if c["kind"] == "RED"
+                        else "OPEN CARRY-OVER BUY" if c["kind"] == "CARRY" else "CROSS-UP BUY")
                 with live_lock:
-                    live_alerts[sym] = {"num": alert_counter[0], "kind": "TREND", "text": text,
+                    live_alerts[sym] = {"num": alert_counter[0], "kind": c["kind"], "text": text,
                                         "price": fr.close, "t0": time.time()}
                 if not AUTO_BUY:
                     try:
@@ -1435,7 +1359,7 @@ def signal_worker(api):
                 last_alert_idx[sym] = fr.bar_index
                 changed = True
                 log(f"ALERT #{alert_counter[0]} {sym} {text} @ {fr.close:.4f} redline-angle={base['redline_angle']} "
-                    f"gap={fr.gap_now:.2f}% black-angle={fr.angle_now:+.1f}")
+                    f"price-angle={base['price_angle']} black-angle={fr.angle_now:+.1f}")
                 append_alert_row({**base, "shown": "Y", "note": ""})
                 if AUTO_BUY:
                     try:
@@ -1459,8 +1383,7 @@ LONG_SYMBOLS = tuple(s for s in SYMBOLS if s not in SHORT_SYMBOLS)
 def status_board_worker():
     """Once a minute: every stock in two groups, LONGS and SHORTS.
     angle = black-line (EMA20) 10-minute angle;  red = up/down vs the bar before;
-    rl = red-line (HMA7) angle over TREND_ANGLE_CANDLES candle(s); gap = red above/below black in percent; ON = the TREND rule is true now.
-    All numbers are on 3-MINUTE candles (angles in % per minute)."""
+    rl = red-line (HMA7) angle over 3 minutes (a red-line buy needs this at 25 or more)."""
     while _RUNNING:
         time.sleep(STATUS_BOARD_SECONDS)
         now_et = et_now()
@@ -1474,10 +1397,9 @@ def status_board_worker():
             held = " [HOLDING]" if sym in open_positions else ""
             if fr is None:
                 return f"{sym}:HOLDING" if sym in open_positions else f"{sym}:no data yet"
-            ra = fr.tr_angle
+            ra = redline_angle(fr)
             ras = "n/a" if math.isnan(ra) else f"{ra:+.0f}"
-            gp = "n/a" if math.isnan(fr.gap_now) else f"{fr.gap_now:+.1f}%"
-            return f"{sym}:angle={fr.angle_now:+5.1f}deg red={'up' if fr.red_now > fr.red_prev else 'down'} rl={ras} gap={gp}{' ON' if fr.trend_on else ''}{held}"
+            return f"{sym}:angle={fr.angle_now:+5.1f}deg red={'up' if fr.red_now > fr.red_prev else 'down'} rl={ras}{held}"
 
         def ups(group):
             return sum(1 for s in group if latest_frame.get(s) is not None and latest_frame[s].red_now > latest_frame[s].red_prev)
@@ -1727,18 +1649,16 @@ def main():
 
     bal = api.get_balance()
     log("=" * 70)
-    log("RSI MOD2 -- ENGINE B 3-MINUTE (you type the number to buy; self-contained file)")
+    log("RSI MOD2 -- ENGINE B REDLINE SAME AS A (you type the number to buy; self-contained file)")
     log("=" * 70)
     if bal:
         log(f"BALANCE  equity=${bal['equity']:,.2f}  cash=${bal['cash']:,.2f}")
         if api.env == "live" and not api.dry_run:
             log("         ^ CHECK THIS ACCOUNT. Ctrl-C now if it is wrong.")
-    log(f"BUYS     3-MINUTE TREND: red rising, red-line angle over {TREND_ANGLE_CANDLES*CANDLE_MINUTES} minutes >= {TREND_MIN_ANGLE:.0f} (per minute), "
-        f"black angle > {TREND_BLACK_MIN:.0f}, red line anywhere  |  cooldown {TREND_COOLDOWN_BARS} candles  |  DROP warning {DROP_WARN_PCT:.0f}% in 2 candles")
+    log(f"BUYS     RED-LINE angle over {REDLINE_ANGLE_BARS} min >= {REDLINE_MIN_ANGLE:.0f}  BLACK_GATE>{REDLINE_BLACK_GATE:.0f}  |  CROSS-UP price angle >= {CROSS_MIN_ANGLE:.0f}  |  "
+        f"OPEN CARRY-OVER {'ON' if CARRY_ON else 'OFF'} (angle >= {CARRY_MIN_ANGLE:.0f}, cross within {CARRY_CROSS_BARS} bars, first {CARRY_WINDOW} bars)")
     log(f"COST     filter {'ON: skip a buy if (ask-bid)/midpoint > %.2f%% or no bid/ask' % COST_MAX_PCT if COST_FILTER else 'OFF'}")
-    log(f"STOPS    " + (f"ON: stop {STOP_PCT:.1f}% and trailing {TRAIL_PCT:.1f}%" if AUTO_STOPS else "OFF (you sell by hand)")
-        + (f"  |  EMERGENCY STOP {EMERGENCY_STOP_PCT:.0f}%" if EMERGENCY_STOP_PCT > 0 else "  |  emergency stop OFF"))
-    log(f"MODE     {RSI_MOD2_MODE}  |  REBUY_WAIT={REBUY_WAIT_MIN:.0f}min  "
+    log(f"MODE     {RSI_MOD2_MODE}  |  STOPS " + ("ON (stop %.1f%%, trailing %.1f%%)" % (STOP_PCT, TRAIL_PCT) if AUTO_STOPS else "OFF (you sell by hand)") + (f", EMERGENCY STOP {EMERGENCY_STOP_PCT:.0f}%" if EMERGENCY_STOP_PCT > 0 else "") + f"  |  REBUY_WAIT={REBUY_WAIT_MIN:.0f}min  "
         f"TRADE_DOLLARS=${TRADE_DOLLARS}  MAX_SLOTS={MAX_SLOTS}  NO_NEW_AFTER={NO_NEW_AFTER_ET} ET  FLAT={EOD_FLATTEN_ET} ET  STALE_BAR_MIN={STALE_BAR_MINUTES}")
     log(f"SUPPRESS per-ticker while open + global slots<={MAX_SLOTS} + same-pair lock")
     log(f"UNIVERSE ({len(SYMBOLS)} tickers) {', '.join(SYMBOLS)}")
@@ -1751,7 +1671,7 @@ def main():
 
     premarket_check(api)
     quote_check(api)
-    print("\nENGINE B 3-MINUTE: when a BUY ALERT appears, type its number and press Enter to buy. Ctrl-C stops the engine.\n", flush=True)
+    print("\nENGINE B: when a BUY ALERT appears, type its number and press Enter to buy. Ctrl-C stops the engine.\n", flush=True)
 
     threading.Thread(target=signal_worker, args=(api,), daemon=True).start()
     threading.Thread(target=sell_monitor_worker, args=(api,), daemon=True).start()
